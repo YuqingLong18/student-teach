@@ -1,0 +1,6 @@
+data/
+.env
+.env.*
+!.env.example
+skills/
+.DS_Store

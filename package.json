@@ -1,0 +1,11 @@
+{
+  "name": "teachlab-classroom",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Classroom peer-LLM dialogue prototype with teacher monitoring and arena submissions.",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --check app.js",
+    "test": "node --test"
+  }
+}

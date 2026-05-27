@@ -1,0 +1,1287 @@
+const http = require("node:http");
+const fsSync = require("node:fs");
+const fs = require("node:fs/promises");
+const path = require("node:path");
+const crypto = require("node:crypto");
+
+loadEnvFile(path.join(__dirname, ".env"));
+
+const PORT = Number(process.env.PORT || 4173);
+const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, "data", "classrooms.json");
+const DATA_DIR = path.dirname(DATA_FILE);
+const PUBLIC_FILES = new Map([
+  ["/", "index.html"],
+  ["/index.html", "index.html"],
+  ["/styles.css", "styles.css"],
+  ["/app.js", "app.js"],
+]);
+
+const MIME_TYPES = {
+  ".html": "text/html; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+};
+
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "openai/gpt-4o-mini";
+const OPENROUTER_JUDGE_MODEL = process.env.OPENROUTER_JUDGE_MODEL || OPENROUTER_MODEL;
+const OPENROUTER_API_URL = process.env.OPENROUTER_API_URL || "https://openrouter.ai/api/v1/chat/completions";
+const PEER_CHALLENGE_LEVELS = new Set(["gentle", "balanced", "rigorous"]);
+
+let store = { teachers: {}, classrooms: {} };
+let lastTimestamp = 0;
+let saveQueue = Promise.resolve();
+const activeArenaAttempts = new Set();
+
+function loadEnvFile(filePath) {
+  if (!fsSync.existsSync(filePath)) return;
+
+  const lines = fsSync.readFileSync(filePath, "utf8").split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+
+    const separatorIndex = trimmed.indexOf("=");
+    if (separatorIndex === -1) continue;
+
+    const key = trimmed.slice(0, separatorIndex).trim();
+    const rawValue = trimmed.slice(separatorIndex + 1).trim();
+    if (!key || process.env[key] !== undefined) continue;
+
+    process.env[key] = rawValue.replace(/^(['"])(.*)\1$/, "$2");
+  }
+}
+
+async function loadData() {
+  try {
+    const raw = await fs.readFile(DATA_FILE, "utf8");
+    store = normalizeStore(JSON.parse(raw));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    store = { teachers: {}, classrooms: {} };
+  }
+
+  if (ensureSessionTokens()) {
+    await saveData();
+  }
+}
+
+async function saveData() {
+  const write = saveQueue.catch(() => {}).then(async () => {
+    await fs.mkdir(DATA_DIR, { recursive: true });
+    await fs.writeFile(DATA_FILE, JSON.stringify(store, null, 2));
+  });
+  saveQueue = write;
+  return write;
+}
+
+function normalizeStore(data) {
+  if (data?.classrooms && data?.teachers) return data;
+  return {
+    teachers: {},
+    classrooms: data && typeof data === "object" ? data : {},
+  };
+}
+
+function jsonResponse(response, status, payload) {
+  response.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+  response.end(JSON.stringify(payload));
+}
+
+function textResponse(response, status, message) {
+  response.writeHead(status, { "Content-Type": "text/plain; charset=utf-8" });
+  response.end(message);
+}
+
+async function parseJsonBody(request) {
+  const chunks = [];
+  for await (const chunk of request) chunks.push(chunk);
+  if (!chunks.length) return {};
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    const error = new Error("Request body must be valid JSON.");
+    error.statusCode = 400;
+    throw error;
+  }
+}
+
+function requireString(value, field) {
+  if (typeof value !== "string" || !value.trim()) {
+    const error = new Error(`${field} is required.`);
+    error.statusCode = 400;
+    throw error;
+  }
+  return value.trim();
+}
+
+function normalizeLines(value, field) {
+  const lines = Array.isArray(value)
+    ? value.map((line) => String(line).trim()).filter(Boolean)
+    : String(value || "")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+
+  if (!lines.length) {
+    const error = new Error(`${field} must include at least one item.`);
+    error.statusCode = 400;
+    throw error;
+  }
+  return lines;
+}
+
+function normalizeQuestions(value) {
+  const questions = Array.isArray(value)
+    ? value
+    : String(value || "")
+        .split("\n")
+        .map((line, index) => {
+          const [prompt, keywords = "", expectedAnswer = "", rubric = ""] = line.split("|").map((part) => part.trim());
+          return {
+            id: `q-${index + 1}`,
+            prompt,
+            expectedAnswer,
+            rubric,
+            keywords: keywords
+              .split(",")
+              .map((keyword) => keyword.trim().toLowerCase())
+              .filter(Boolean),
+          };
+        });
+
+  const normalized = questions
+    .map((question, index) => ({
+      id: question.id || `q-${index + 1}`,
+      prompt: String(question.prompt || "").trim(),
+      expectedAnswer: String(question.expectedAnswer || "").trim(),
+      rubric: String(question.rubric || "").trim(),
+      keywords: Array.isArray(question.keywords)
+        ? question.keywords.map((keyword) => String(keyword).trim().toLowerCase()).filter(Boolean)
+        : String(question.keywords || "")
+            .split(",")
+            .map((keyword) => keyword.trim().toLowerCase())
+            .filter(Boolean),
+    }))
+    .filter((question) => question.prompt);
+
+  if (!normalized.length) {
+    const error = new Error("testQuestions must include at least one question.");
+    error.statusCode = 400;
+    throw error;
+  }
+  return normalized;
+}
+
+function normalizePeerChallenge(value) {
+  const level = String(value || "balanced")
+    .trim()
+    .toLowerCase();
+  if (PEER_CHALLENGE_LEVELS.has(level)) return level;
+
+  const error = new Error("peerChallenge must be gentle, balanced, or rigorous.");
+  error.statusCode = 400;
+  throw error;
+}
+
+function generateCode() {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code = "";
+  do {
+    code = Array.from({ length: 6 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join("");
+  } while (store.classrooms[code]);
+  return code;
+}
+
+function now() {
+  const time = Date.now();
+  const nextTime = time <= lastTimestamp ? lastTimestamp + 1 : time;
+  lastTimestamp = nextTime;
+  return new Date(nextTime).toISOString();
+}
+
+function ensureSessionTokens() {
+  let changed = false;
+  for (const room of Object.values(store.classrooms)) {
+    if (!PEER_CHALLENGE_LEVELS.has(room.peerChallenge)) {
+      room.peerChallenge = "balanced";
+      changed = true;
+    }
+
+    if (typeof room.joinLocked !== "boolean") {
+      room.joinLocked = false;
+      changed = true;
+    }
+
+    if (typeof room.activityClosed !== "boolean") {
+      room.activityClosed = false;
+      changed = true;
+    }
+
+    if (!room.teacherToken) {
+      room.teacherToken = crypto.randomUUID();
+      changed = true;
+    }
+
+    for (const student of Object.values(room.students || {})) {
+      if (!Array.isArray(student.readinessChecks)) {
+        student.readinessChecks = [];
+        changed = true;
+      }
+
+      if (!student.studentToken) {
+        student.studentToken = crypto.randomUUID();
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
+function teacherIdForName(name) {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "teacher";
+}
+
+function getOrCreateTeacher(name) {
+  const normalizedName = requireString(name, "teacherName");
+  const idBase = teacherIdForName(normalizedName);
+  let id = idBase;
+  let suffix = 2;
+
+  while (store.teachers[id] && store.teachers[id].name.toLowerCase() !== normalizedName.toLowerCase()) {
+    id = `${idBase}-${suffix}`;
+    suffix += 1;
+  }
+
+  if (!store.teachers[id]) {
+    store.teachers[id] = {
+      id,
+      name: normalizedName,
+      sessionToken: crypto.randomUUID(),
+      createdAt: now(),
+      updatedAt: now(),
+    };
+  } else {
+    store.teachers[id].name = normalizedName;
+    store.teachers[id].sessionToken = crypto.randomUUID();
+    store.teachers[id].updatedAt = now();
+  }
+
+  return store.teachers[id];
+}
+
+function publicTeacher(teacher) {
+  return {
+    id: teacher.id,
+    name: teacher.name,
+    createdAt: teacher.createdAt,
+    updatedAt: teacher.updatedAt,
+  };
+}
+
+function requireTeacherSession(request) {
+  const teacherId = request.headers["x-teacher-id"];
+  const token = request.headers["x-teacher-session"];
+  const teacher = teacherId ? store.teachers[teacherId] : null;
+  if (!teacher || teacher.sessionToken !== token) {
+    const error = new Error("Teacher login is required.");
+    error.statusCode = 401;
+    throw error;
+  }
+  return teacher;
+}
+
+function buildVocabulary(messages) {
+  return messages
+    .filter((message) => message.sender === "student")
+    .map((message) => message.text.toLowerCase())
+    .join(" ");
+}
+
+function peerProviderStatus() {
+  return {
+    mode: OPENROUTER_API_KEY ? "openrouter" : "simulator",
+    model: OPENROUTER_API_KEY ? OPENROUTER_MODEL : "local-simulator",
+  };
+}
+
+function conversationTranscript(student) {
+  return student.messages
+    .filter((message) => message.sender === "student" || message.sender === "peer" || message.sender === "system")
+    .slice(-12)
+    .map((message) => {
+      if (message.sender === "student") return `Student teacher: ${message.text}`;
+      if (message.sender === "peer") return `Peer LLM: ${message.text}`;
+      return `Arena feedback: ${message.text}`;
+    })
+    .join("\n");
+}
+
+function teachingTranscript(student) {
+  return student.messages
+    .filter((message) => message.sender === "student")
+    .map((message) => `Student teacher: ${message.text}`)
+    .join("\n");
+}
+
+function objectiveCoverage(room, student) {
+  const progress = objectiveProgress(room, student);
+  if (!progress.length) return 0;
+  const covered = progress.filter((objective) => objective.covered).length;
+  return Math.round((covered / progress.length) * 100);
+}
+
+function objectiveTerms(objective) {
+  return objective
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((term) => term.length > 4)
+    .filter((term, index, terms) => terms.indexOf(term) === index);
+}
+
+function objectiveProgress(room, student) {
+  const taughtText = buildVocabulary(student.messages);
+  return room.objectives.map((objective, index) => {
+    const terms = objectiveTerms(objective);
+    const matchedTerms = terms.filter((term) => taughtText.includes(term));
+    return {
+      id: `objective-${index + 1}`,
+      text: objective,
+      covered: terms.length ? matchedTerms.length > 0 : taughtText.includes(objective.toLowerCase()),
+      matchedTerms,
+      missingTerms: terms.filter((term) => !matchedTerms.includes(term)),
+    };
+  });
+}
+
+function latestAttempt(student) {
+  return student.testAttempts.at(-1) || null;
+}
+
+function latestMissingConcepts(student) {
+  const attempt = latestAttempt(student);
+  if (!attempt) return [];
+
+  return attempt.results
+    .flatMap((result) => result.missingWords || [])
+    .filter((word, index, words) => words.indexOf(word) === index);
+}
+
+function latestAttemptNeedsCorrection(student) {
+  const attempt = latestAttempt(student);
+  return Boolean(attempt?.results.some((result) => !result.correct));
+}
+
+function correctionTurnsAfterLatestAttempt(student) {
+  const attempt = latestAttempt(student);
+  if (!attempt) return 0;
+  const attemptTime = new Date(attempt.createdAt).getTime();
+  return student.messages.filter((message) => {
+    return message.sender === "student" && new Date(message.createdAt).getTime() > attemptTime;
+  }).length;
+}
+
+function choosePeerQuestion(room, student) {
+  const challenge = room.peerChallenge || "balanced";
+  const missingConcepts = latestMissingConcepts(student);
+  if (missingConcepts.length && latestAttemptNeedsCorrection(student)) {
+    if (challenge === "gentle") {
+      return `I see I missed ${missingConcepts.join(", ")} in the arena. Can you walk me through that idea again with one simple example?`;
+    }
+    if (challenge === "rigorous") {
+      return `I missed ${missingConcepts.join(", ")} in the arena. Can you identify exactly where my reasoning broke, correct it, and then make me explain the idea back without hints?`;
+    }
+    return `I see I missed ${missingConcepts.join(", ")} in the arena. Can you correct my misunderstanding and then ask me to explain that part back in my own words?`;
+  }
+
+  const taughtText = buildVocabulary(student.messages);
+  const objective = room.objectives.find((item) => {
+    const terms = item
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((term) => term.length > 4);
+    return !terms.some((term) => taughtText.includes(term));
+  });
+
+  if (objective) {
+    if (challenge === "gentle") {
+      return `I am still unsure about "${objective}". Can you explain it again with a small everyday example?`;
+    }
+    if (challenge === "rigorous") {
+      return `I am not convinced I understand "${objective}" yet. Can you prove it with an example, name a common misconception, and ask me a check question?`;
+    }
+    return `I can follow part of that, but I am still shaky on "${objective}". Can you teach it again using a concrete example and then ask me to explain it back?`;
+  }
+
+  const promptsByChallenge = {
+    gentle: [
+      "Can you give me one more example before I try to explain it back?",
+      "Can you ask me a short checking question so I can see what I remember?",
+      "Can you show how this connects to one other idea from class?",
+    ],
+    balanced: [
+      "Can you ask me a checking question so you can see whether I really understand?",
+      "What is a common mistake someone might make here, and how would you correct me if I made it?",
+      "Can you connect this to another objective so I understand how the ideas fit together?",
+    ],
+    rigorous: [
+      "Can you give me a tricky checking question that would reveal whether I only memorized the words?",
+      "What counterexample or edge case would check whether I really understand this?",
+      "Can you make me compare two objectives and explain the causal link between them?",
+    ],
+  };
+  const prompts = promptsByChallenge[challenge] || promptsByChallenge.balanced;
+  return prompts[student.messages.length % prompts.length];
+}
+
+function peerChallengeInstruction(level) {
+  const instructions = {
+    gentle: "Challenge level: gentle. Ask supportive, scaffolded questions and request one concrete example at a time.",
+    balanced:
+      "Challenge level: balanced. Ask detailed follow-up questions that reveal gaps without overwhelming the student teacher.",
+    rigorous:
+      "Challenge level: rigorous. Be skeptical, ask for evidence, misconceptions, edge cases, and explanation-back checks.",
+  };
+  return instructions[level] || instructions.balanced;
+}
+
+function mathFormattingInstruction() {
+  return "When writing math, use LaTeX delimiters for display: inline math as \\( ... \\) and larger formulas as \\[ ... \\]. Avoid plain-text caret notation when LaTeX is clearer.";
+}
+
+function extractChatText(payload) {
+  const text = String(payload.choices?.[0]?.message?.content || "").trim();
+  if (!text) {
+    throw new Error("The LLM provider returned no text.");
+  }
+  return text;
+}
+
+async function callOpenRouter({ system, user, maxOutputTokens = 180, model = OPENROUTER_MODEL, temperature }) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+  const body = {
+    model,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    max_tokens: maxOutputTokens,
+  };
+
+  if (temperature !== undefined) {
+    body.temperature = temperature;
+  }
+
+  try {
+    const response = await fetch(OPENROUTER_API_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.error?.message || `OpenRouter request failed with ${response.status}.`);
+    }
+    return extractChatText(payload);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function parseJudgeDecision(text) {
+  const normalized = text.toLowerCase().trim();
+  const compact = normalized.replace(/[^a-z]/g, "");
+
+  if (compact === "correct") return true;
+  if (compact === "incorrect") return false;
+  if (/\bincorrect\b/.test(normalized)) return false;
+  if (/\bcorrect\b/.test(normalized)) return true;
+  return false;
+}
+
+function extractFinalAnswer(answer) {
+  const match = String(answer || "").match(/(?:^|\n)\s*final answer\s*:\s*(.+?)\s*$/i);
+  if (!match) return "";
+  return match[1].trim();
+}
+
+function isNotSureFinalAnswer(finalAnswer) {
+  return /^not sure what to do\.?$/i.test(finalAnswer.trim());
+}
+
+async function judgeArenaAnswer(question, answer, transcript) {
+  const finalAnswer = extractFinalAnswer(answer);
+  if (!finalAnswer || isNotSureFinalAnswer(finalAnswer)) return false;
+
+  const decision = await callOpenRouter({
+    model: OPENROUTER_JUDGE_MODEL,
+    temperature: 0,
+    maxOutputTokens: 4,
+    system: [
+      "You are a strict math classroom answer judge.",
+      "Grade only the peer's final answer.",
+      "Mark correct only if the final answer is mathematically correct and the required method or fact is supported by the student teaching transcript.",
+      "Mark incorrect if the final answer is wrong, incomplete, unsupported by the student teaching transcript, or not actually an answer to the problem.",
+      "Reply with exactly one lowercase word: correct or incorrect.",
+    ].join("\n"),
+    user: [
+      `Student teaching and coaching transcript:\n${transcript || "The student has not taught anything yet."}`,
+      `Arena problem:\n${question.prompt}`,
+      question.expectedAnswer ? `Teacher answer key:\n${question.expectedAnswer}` : "",
+      question.rubric ? `Teacher rubric:\n${question.rubric}` : "",
+      question.keywords.length ? `Required concepts or answer markers:\n${question.keywords.join(", ")}` : "",
+      `Peer final answer:\n${finalAnswer}`,
+      "Decision:",
+    ]
+      .filter(Boolean)
+      .join("\n\n"),
+  });
+
+  return parseJudgeDecision(decision);
+}
+
+function missingConceptHints(question, answer, correct) {
+  if (correct) return [];
+
+  const answerText = answer.toLowerCase();
+  const missingKeywords = question.keywords.filter((keyword) => !answerText.includes(keyword));
+  return missingKeywords.length ? missingKeywords : ["complete answer"];
+}
+
+async function mapWithConcurrency(items, limit, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  }
+
+  const workerCount = Math.min(limit, items.length);
+  await Promise.all(Array.from({ length: workerCount }, worker));
+  return results;
+}
+
+async function generatePeerReply(room, student) {
+  if (!OPENROUTER_API_KEY) {
+    return choosePeerQuestion(room, student);
+  }
+
+  return callOpenRouter({
+    system: [
+      room.systemPrompt,
+      peerChallengeInstruction(room.peerChallenge),
+      mathFormattingInstruction(),
+      "You are a peer student being taught by the student teacher.",
+      "Ask exactly one detailed follow-up question that exposes confusion, tests reasoning, or asks the student to connect concepts.",
+      "Do not give the full answer yourself. Keep the response under 90 words.",
+      `Teaching objectives:\n${room.objectives.map((objective) => `- ${objective}`).join("\n")}`,
+    ].join("\n\n"),
+    user: `Conversation so far:\n${conversationTranscript(student)}\n\nRespond as the peer student.`,
+  });
+}
+
+function createPeerAnswer(question, vocabulary) {
+  const knownWords = question.keywords.filter((keyword) => vocabulary.includes(keyword));
+  const missingWords = question.keywords.filter((keyword) => !vocabulary.includes(keyword));
+
+  if (!knownWords.length) {
+    return {
+      answer:
+        "I am not confident yet. I remember the conversation, but I cannot answer this with the right concepts.\n\nfinal answer: not sure what to do",
+      missingWords,
+      expectedAnswer: question.expectedAnswer,
+      rubric: question.rubric,
+      correct: false,
+    };
+  }
+
+  if (missingWords.length) {
+    return {
+      answer: `I would use ${knownWords.join(", ")} in my answer, but I still need help connecting ${missingWords.join(
+        ", ",
+      )}.\n\nfinal answer: not sure what to do`,
+      missingWords,
+      expectedAnswer: question.expectedAnswer,
+      rubric: question.rubric,
+      correct: false,
+    };
+  }
+
+  return {
+    answer:
+      question.expectedAnswer
+        ? `${question.expectedAnswer}\n\nfinal answer: ${question.expectedAnswer}`
+        : `I can answer this now. The key ideas are ${question.keywords.join(
+            ", ",
+          )}, and I can connect them in a complete explanation.\n\nfinal answer: ${question.keywords.join(", ")}`,
+    missingWords: [],
+    expectedAnswer: question.expectedAnswer,
+    rubric: question.rubric,
+    correct: true,
+  };
+}
+
+async function createTestAnswer(room, student, question, transcript) {
+  if (!OPENROUTER_API_KEY) {
+    return createPeerAnswer(question, buildVocabulary(student.messages));
+  }
+
+  try {
+    const answer = await callOpenRouter({
+      system: [
+        room.systemPrompt,
+        mathFormattingInstruction(),
+        "You are now entering the classroom arena as the student's trained peer LLM.",
+        "Use only the methods, concepts, and explanations the student teacher taught you.",
+        "If the student teacher did not teach enough, attempt the problem honestly and say what you are unsure about.",
+        "End every arena response with exactly one final line in this format: final answer: <your answer>.",
+        "If you cannot solve it from what the student taught you, the final line must be exactly: final answer: not sure what to do.",
+        "Keep the answer concise.",
+      ].join("\n\n"),
+      user: [
+        `Student teaching and coaching transcript:\n${transcript || "The student has not taught anything yet."}`,
+        `Arena problem: ${question.prompt}`,
+      ]
+        .filter(Boolean)
+        .join("\n\n"),
+      maxOutputTokens: 220,
+    });
+    const correct = await judgeArenaAnswer(question, answer, transcript);
+
+    return {
+      answer,
+      missingWords: missingConceptHints(question, answer, correct),
+      expectedAnswer: question.expectedAnswer,
+      rubric: question.rubric,
+      correct,
+    };
+  } catch (error) {
+    console.error(`Arena answer failed for ${room.code} ${question.id || question.prompt}: ${error.message}`);
+    return {
+      answer: "The peer could not produce an arena answer for this problem.",
+      missingWords: ["complete answer"],
+      expectedAnswer: question.expectedAnswer,
+      rubric: question.rubric,
+      correct: false,
+      error: error.message,
+    };
+  }
+}
+
+async function createReadinessCheck(room, student) {
+  const progress = objectiveProgress(room, student);
+  const covered = progress.filter((objective) => objective.covered);
+  const open = progress.filter((objective) => !objective.covered);
+
+  if (!OPENROUTER_API_KEY) {
+    const summary = open.length
+      ? `I think I can explain ${covered.length}/${progress.length} objectives. I still need teaching on ${open
+          .map((objective) => objective.text)
+          .join("; ")} before I enter the arena.`
+      : `I think I can explain all ${progress.length} objectives. Please ask me one final check question or send me to the arena.`;
+
+    return {
+      id: crypto.randomUUID(),
+      createdAt: now(),
+      provider: peerProviderStatus(),
+      coveredObjectives: covered.map((objective) => objective.id),
+      missingObjectives: open.map((objective) => objective.id),
+      summary,
+    };
+  }
+
+  const summary = await callOpenRouter({
+    system: [
+      room.systemPrompt,
+      peerChallengeInstruction(room.peerChallenge),
+      mathFormattingInstruction(),
+      "You are a peer student checking whether you are ready for the classroom arena.",
+      "Summarize what you believe you understand from the student teacher, name any remaining confusion, and ask for one targeted correction if needed.",
+      "Do not use outside knowledge beyond the transcript. Keep the response under 120 words.",
+    ].join("\n\n"),
+    user: [
+      `Teaching objectives:\n${room.objectives.map((objective) => `- ${objective}`).join("\n")}`,
+      `Conversation transcript:\n${conversationTranscript(student)}`,
+    ].join("\n\n"),
+    maxOutputTokens: 220,
+  });
+
+  return {
+    id: crypto.randomUUID(),
+    createdAt: now(),
+    provider: peerProviderStatus(),
+    coveredObjectives: covered.map((objective) => objective.id),
+    missingObjectives: open.map((objective) => objective.id),
+    summary,
+  };
+}
+
+function scoreLatestTest(room, student) {
+  const attempt = latestAttempt(student);
+  if (!attempt) return null;
+  const correct = attempt.results.filter((result) => result.correct).length;
+  return {
+    correct,
+    total: room.testQuestions.length,
+    percent: room.testQuestions.length ? Math.round((correct / room.testQuestions.length) * 100) : 0,
+  };
+}
+
+function arenaLeaderboardFromStudents(students) {
+  return students
+    .map((student) => {
+      const best = student.testAttempts
+        .map((attempt, index) => {
+          const correct = attempt.results.filter((result) => result.correct).length;
+          const total = attempt.results.length;
+          return {
+            attemptNumber: index + 1,
+            createdAt: attempt.createdAt,
+            correct,
+            total,
+            percent: total ? Math.round((correct / total) * 100) : 0,
+          };
+        })
+        .sort((left, right) => right.percent - left.percent || right.correct - left.correct || left.attemptNumber - right.attemptNumber)[0];
+
+      if (!best) return null;
+      return {
+        studentId: student.id,
+        name: student.name,
+        attempts: student.testAttempts.length,
+        ...best,
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => right.percent - left.percent || right.correct - left.correct || left.name.localeCompare(right.name))
+    .slice(0, 5)
+    .map((entry, index) => ({ rank: index + 1, ...entry }));
+}
+
+function arenaLeaderboard(room) {
+  return arenaLeaderboardFromStudents(Object.values(room.students || {}));
+}
+
+function summarizeRoom(room) {
+  const students = Object.values(room.students).map((student) => ({
+    id: student.id,
+    name: student.name,
+    status: student.status,
+    joinedAt: student.joinedAt,
+    updatedAt: student.updatedAt,
+    teachingTurns: student.messages.filter((message) => message.sender === "student").length,
+    peerTurns: student.messages.filter((message) => message.sender === "peer").length,
+    correctionTurns: correctionTurnsAfterLatestAttempt(student),
+    objectiveProgress: objectiveProgress(room, student),
+    objectiveCoverage: objectiveCoverage(room, student),
+    latestScore: scoreLatestTest(room, student),
+    recentMessages: student.messages.slice(-4),
+    messageHistory: student.messages,
+    latestAttempt: latestAttempt(student),
+    attemptHistory: student.testAttempts,
+    latestReadiness: student.readinessChecks.at(-1) || null,
+    readinessHistory: student.readinessChecks,
+    missingConcepts: latestMissingConcepts(student),
+    readinessChecks: student.readinessChecks.length,
+    testAttempts: student.testAttempts.length,
+  }));
+
+  return {
+    code: room.code,
+    title: room.title,
+    teacherId: room.teacherId || null,
+    teacherName: room.teacherName,
+    systemPrompt: room.systemPrompt,
+    peerChallenge: room.peerChallenge,
+    objectives: room.objectives,
+    testQuestions: room.testQuestions,
+    joinLocked: room.joinLocked,
+    activityClosed: room.activityClosed,
+    peerProvider: peerProviderStatus(),
+    analytics: roomAnalytics(students),
+    arenaLeaderboard: arenaLeaderboard(room),
+    students,
+    createdAt: room.createdAt,
+    updatedAt: room.updatedAt,
+  };
+}
+
+function roomAnalytics(students) {
+  const totalStudents = students.length;
+  const testReady = students.filter((student) => student.status === "Arena ranked" || student.status === "Test ready").length;
+  const needsCorrection = students.filter((student) => {
+    return student.status === "Needs correction" || student.status === "Correcting";
+  }).length;
+  const teaching = students.filter((student) => student.status === "Teaching").length;
+  const tested = students.filter((student) => student.latestScore).length;
+  const readinessChecked = students.filter((student) => student.latestReadiness).length;
+  const readinessReady = students.filter((student) => {
+    return student.latestReadiness && student.latestReadiness.missingObjectives.length === 0;
+  }).length;
+  const readinessOpen = students.filter((student) => {
+    return student.latestReadiness && student.latestReadiness.missingObjectives.length > 0;
+  }).length;
+  const averageCoverage = totalStudents
+    ? Math.round(students.reduce((sum, student) => sum + student.objectiveCoverage, 0) / totalStudents)
+    : 0;
+  const averageScore = tested
+    ? Math.round(students.reduce((sum, student) => sum + (student.latestScore?.percent || 0), 0) / tested)
+    : 0;
+
+  return {
+    totalStudents,
+    teaching,
+    needsCorrection,
+    testReady,
+    tested,
+    readinessChecked,
+    readinessReady,
+    readinessOpen,
+    averageCoverage,
+    averageScore,
+    leaderboard: arenaLeaderboardFromStudents(
+      students.map((student) => ({
+        id: student.id,
+        name: student.name,
+        testAttempts: student.attemptHistory || [],
+      })),
+    ),
+  };
+}
+
+function publicArenaProblems(room) {
+  return room.testQuestions.map((question, index) => ({
+    id: question.id || `q-${index + 1}`,
+    prompt: question.prompt,
+  }));
+}
+
+function publicArenaAttempts(student) {
+  return student.testAttempts.map((attempt) => ({
+    id: attempt.id,
+    createdAt: attempt.createdAt,
+    provider: attempt.provider,
+    results: attempt.results.map((result) => ({
+      answer: result.answer,
+      missingWords: result.missingWords || [],
+      correct: result.correct,
+    })),
+  }));
+}
+
+function arenaFeedbackMessage(room, results, correctCount) {
+  const lines = results.map((result, index) => {
+    const question = room.testQuestions[index];
+    const status = result.correct ? "correct" : "needs coaching";
+    const missing = result.missingWords?.length ? ` Missing concepts: ${result.missingWords.join(", ")}.` : "";
+    return `Problem ${index + 1} (${status}): ${question.prompt}\nPeer solution: ${result.answer}${missing}`;
+  });
+
+  return [
+    `Arena submission scored ${correctCount}/${room.testQuestions.length}.`,
+    ...lines,
+    correctCount === room.testQuestions.length
+      ? "The peer is ready for the leaderboard. Keep refining explanations if you want a stronger solution style."
+      : "Use the chat to teach the missed concepts, ask the peer to explain them back, then enter the arena again.",
+  ].join("\n\n");
+}
+
+function ownedRoomSummary(room) {
+  return {
+    code: room.code,
+    title: room.title,
+    teacherName: room.teacherName,
+    peerProvider: peerProviderStatus(),
+    peerChallenge: room.peerChallenge,
+    studentCount: Object.keys(room.students || {}).length,
+    joinLocked: room.joinLocked,
+    activityClosed: room.activityClosed,
+    createdAt: room.createdAt,
+    updatedAt: room.updatedAt,
+  };
+}
+
+function publicRoom(room) {
+  return {
+    code: room.code,
+    title: room.title,
+    teacherName: room.teacherName,
+    peerChallenge: room.peerChallenge,
+    objectives: room.objectives,
+    testQuestions: publicArenaProblems(room),
+    arenaLeaderboard: arenaLeaderboard(room),
+    joinLocked: room.joinLocked,
+    activityClosed: room.activityClosed,
+    peerProvider: peerProviderStatus(),
+    createdAt: room.createdAt,
+    updatedAt: room.updatedAt,
+  };
+}
+
+function publicStudent(student, room) {
+  return {
+    id: student.id,
+    name: student.name,
+    status: student.status,
+    messages: student.messages,
+    readinessChecks: student.readinessChecks,
+    testAttempts: publicArenaAttempts(student),
+    correctionTurns: correctionTurnsAfterLatestAttempt(student),
+    objectiveProgress: objectiveProgress(room, student),
+    missingConcepts: latestMissingConcepts(student),
+    joinedAt: student.joinedAt,
+    updatedAt: student.updatedAt,
+  };
+}
+
+function requireTeacherToken(request, room) {
+  const token = request.headers["x-teacher-token"];
+  if (!room.teacherToken || token !== room.teacherToken) {
+    const error = new Error("Teacher session is required for this classroom.");
+    error.statusCode = 401;
+    throw error;
+  }
+}
+
+function isRoomOwner(teacher, room) {
+  return Boolean(teacher && (room.teacherId === teacher.id || (!room.teacherId && room.teacherName === teacher.name)));
+}
+
+function requireTeacherAccess(request, room) {
+  const roomToken = request.headers["x-teacher-token"];
+  if (room.teacherToken && roomToken === room.teacherToken) return;
+
+  try {
+    const teacher = requireTeacherSession(request);
+    if (isRoomOwner(teacher, room)) return;
+  } catch {
+    // Fall through to the classroom-specific access error below.
+  }
+
+  const error = new Error("Teacher access is required for this classroom.");
+  error.statusCode = 401;
+  throw error;
+}
+
+function requireStudentToken(request, student) {
+  const token = request.headers["x-student-token"];
+  if (!student.studentToken || token !== student.studentToken) {
+    const error = new Error("Student session is required for this workspace.");
+    error.statusCode = 401;
+    throw error;
+  }
+}
+
+function requireOpenActivity(room) {
+  if (room.activityClosed) {
+    const error = new Error("This classroom activity is closed.");
+    error.statusCode = 403;
+    throw error;
+  }
+}
+
+function requireRoom(code) {
+  const room = store.classrooms[code];
+  if (!room) {
+    const error = new Error("Classroom not found.");
+    error.statusCode = 404;
+    throw error;
+  }
+  return room;
+}
+
+function requireStudent(room, studentId) {
+  const student = room.students[studentId];
+  if (!student) {
+    const error = new Error("Student not found.");
+    error.statusCode = 404;
+    throw error;
+  }
+  return student;
+}
+
+function arenaAttemptKey(room, student) {
+  return `${room.code}:${student.id}`;
+}
+
+async function handleApi(request, response, url) {
+  const parts = url.pathname.split("/").filter(Boolean);
+
+  if (request.method === "POST" && url.pathname === "/api/teachers/login") {
+    const body = await parseJsonBody(request);
+    const teacher = getOrCreateTeacher(body.teacherName);
+    await saveData();
+    return jsonResponse(response, 200, {
+      teacher: publicTeacher(teacher),
+      teacherSession: teacher.sessionToken,
+    });
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/teachers/me/classrooms") {
+    const teacher = requireTeacherSession(request);
+    const rooms = Object.values(store.classrooms)
+      .filter((room) => room.teacherId === teacher.id || (!room.teacherId && room.teacherName === teacher.name))
+      .map((room) => ownedRoomSummary(room));
+    return jsonResponse(response, 200, { teacher: publicTeacher(teacher), classrooms: rooms });
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/classrooms") {
+    const teacher = requireTeacherSession(request);
+    const body = await parseJsonBody(request);
+    const code = generateCode();
+    const room = {
+      code,
+      title: requireString(body.title, "title"),
+      teacherId: teacher.id,
+      teacherName: teacher.name,
+      systemPrompt: requireString(body.systemPrompt, "systemPrompt"),
+      peerChallenge: normalizePeerChallenge(body.peerChallenge),
+      objectives: normalizeLines(body.objectives, "objectives"),
+      testQuestions: normalizeQuestions(body.testQuestions),
+      joinLocked: false,
+      activityClosed: false,
+      students: {},
+      teacherToken: crypto.randomUUID(),
+      createdAt: now(),
+      updatedAt: now(),
+    };
+    store.classrooms[code] = room;
+    await saveData();
+    return jsonResponse(response, 201, { room: summarizeRoom(room), teacherToken: room.teacherToken });
+  }
+
+  if (parts[0] !== "api" || parts[1] !== "classrooms" || !parts[2]) {
+    return jsonResponse(response, 404, { error: "API route not found." });
+  }
+
+  const code = parts[2].toUpperCase();
+  const room = requireRoom(code);
+
+  if (request.method === "GET" && parts.length === 3) {
+    requireTeacherAccess(request, room);
+    return jsonResponse(response, 200, { room: summarizeRoom(room) });
+  }
+
+  if (request.method === "PATCH" && parts.length === 4 && parts[3] === "config") {
+    requireTeacherAccess(request, room);
+    const body = await parseJsonBody(request);
+    room.title = requireString(body.title, "title");
+    room.systemPrompt = requireString(body.systemPrompt, "systemPrompt");
+    room.peerChallenge = normalizePeerChallenge(body.peerChallenge || room.peerChallenge);
+    room.objectives = normalizeLines(body.objectives, "objectives");
+    room.testQuestions = normalizeQuestions(body.testQuestions);
+    room.updatedAt = now();
+    await saveData();
+    return jsonResponse(response, 200, { room: summarizeRoom(room) });
+  }
+
+  if (request.method === "PATCH" && parts.length === 4 && parts[3] === "access") {
+    requireTeacherAccess(request, room);
+    const body = await parseJsonBody(request);
+    if (body.joinLocked !== undefined && typeof body.joinLocked !== "boolean") {
+      const error = new Error("joinLocked must be true or false.");
+      error.statusCode = 400;
+      throw error;
+    }
+    if (body.activityClosed !== undefined && typeof body.activityClosed !== "boolean") {
+      const error = new Error("activityClosed must be true or false.");
+      error.statusCode = 400;
+      throw error;
+    }
+    if (body.joinLocked === undefined && body.activityClosed === undefined) {
+      const error = new Error("At least one access setting is required.");
+      error.statusCode = 400;
+      throw error;
+    }
+    if (body.joinLocked !== undefined) room.joinLocked = body.joinLocked;
+    if (body.activityClosed !== undefined) room.activityClosed = body.activityClosed;
+    room.updatedAt = now();
+    await saveData();
+    return jsonResponse(response, 200, { room: summarizeRoom(room) });
+  }
+
+  if (request.method === "POST" && parts.length === 4 && parts[3] === "students") {
+    if (room.joinLocked || room.activityClosed) {
+      const error = new Error("This classroom is not accepting new students right now.");
+      error.statusCode = 403;
+      throw error;
+    }
+
+    const body = await parseJsonBody(request);
+    const name = requireString(body.name, "name");
+    const studentId = crypto.randomUUID();
+    room.students[studentId] = {
+      id: studentId,
+      name,
+      status: "Teaching",
+      messages: [
+        {
+          id: crypto.randomUUID(),
+          sender: "system",
+          text: "Your peer is ready. Teach it the objectives, then enter it into the arena when you are confident.",
+          createdAt: now(),
+        },
+        {
+          id: crypto.randomUUID(),
+          sender: "peer",
+          text: `Hi ${name}. I am your peer student. I will ask questions until I am ready for the arena. What should I understand first?`,
+          createdAt: now(),
+        },
+      ],
+      readinessChecks: [],
+      testAttempts: [],
+      studentToken: crypto.randomUUID(),
+      joinedAt: now(),
+      updatedAt: now(),
+    };
+    room.updatedAt = now();
+    await saveData();
+    return jsonResponse(response, 201, {
+      room: publicRoom(room),
+      student: publicStudent(room.students[studentId], room),
+      studentToken: room.students[studentId].studentToken,
+    });
+  }
+
+  if (parts.length < 5 || parts[3] !== "students") {
+    return jsonResponse(response, 404, { error: "API route not found." });
+  }
+
+  const student = requireStudent(room, parts[4]);
+
+  if (request.method === "GET" && parts.length === 5) {
+    requireStudentToken(request, student);
+    return jsonResponse(response, 200, { room: publicRoom(room), student: publicStudent(student, room) });
+  }
+
+  if (request.method === "POST" && parts.length === 6 && parts[5] === "messages") {
+    requireStudentToken(request, student);
+    requireOpenActivity(room);
+    const body = await parseJsonBody(request);
+    const text = requireString(body.text, "text");
+    const isCorrection = latestAttemptNeedsCorrection(student);
+    student.messages.push({ id: crypto.randomUUID(), sender: "student", text, createdAt: now() });
+    student.messages.push({
+      id: crypto.randomUUID(),
+      sender: "peer",
+      text: await generatePeerReply(room, student),
+      provider: peerProviderStatus(),
+      createdAt: now(),
+    });
+    student.status = isCorrection ? "Correcting" : "Teaching";
+    student.updatedAt = now();
+    room.updatedAt = now();
+    await saveData();
+    return jsonResponse(response, 201, { room: publicRoom(room), student: publicStudent(student, room) });
+  }
+
+  if (request.method === "POST" && parts.length === 6 && parts[5] === "readiness-checks") {
+    requireStudentToken(request, student);
+    requireOpenActivity(room);
+    const check = await createReadinessCheck(room, student);
+    student.readinessChecks.push(check);
+    student.messages.push({
+      id: crypto.randomUUID(),
+      sender: "peer",
+      text: `Readiness check: ${check.summary}`,
+      provider: check.provider,
+      createdAt: check.createdAt,
+    });
+    student.updatedAt = now();
+    room.updatedAt = now();
+    await saveData();
+    return jsonResponse(response, 201, { room: publicRoom(room), student: publicStudent(student, room) });
+  }
+
+  if (request.method === "POST" && parts.length === 6 && parts[5] === "test-attempts") {
+    requireStudentToken(request, student);
+    requireOpenActivity(room);
+    const attemptKey = arenaAttemptKey(room, student);
+    if (activeArenaAttempts.has(attemptKey)) {
+      const error = new Error("An arena submission is already running for this student.");
+      error.statusCode = 409;
+      throw error;
+    }
+
+    activeArenaAttempts.add(attemptKey);
+    try {
+      const transcript = teachingTranscript(student);
+      const results = await mapWithConcurrency(room.testQuestions, 3, (question) => createTestAnswer(room, student, question, transcript));
+      const correct = results.filter((result) => result.correct).length;
+      student.testAttempts.push({
+        id: crypto.randomUUID(),
+        createdAt: now(),
+        provider: peerProviderStatus(),
+        results,
+      });
+      student.status = correct === room.testQuestions.length ? "Arena ranked" : "Needs correction";
+      student.messages.push({
+        id: crypto.randomUUID(),
+        sender: "system",
+        text: arenaFeedbackMessage(room, results, correct),
+        createdAt: now(),
+      });
+      student.updatedAt = now();
+      room.updatedAt = now();
+      await saveData();
+      return jsonResponse(response, 201, { room: publicRoom(room), student: publicStudent(student, room) });
+    } finally {
+      activeArenaAttempts.delete(attemptKey);
+    }
+  }
+
+  return jsonResponse(response, 404, { error: "API route not found." });
+}
+
+async function handleStatic(response, url) {
+  const fileName = PUBLIC_FILES.get(url.pathname);
+  if (!fileName) return textResponse(response, 404, "Not found");
+
+  const filePath = path.join(__dirname, fileName);
+  const content = await fs.readFile(filePath);
+  response.writeHead(200, {
+    "Content-Type": MIME_TYPES[path.extname(filePath)] || "application/octet-stream",
+    "Cache-Control": "no-store",
+  });
+  response.end(content);
+}
+
+const server = http.createServer(async (request, response) => {
+  try {
+    const url = new URL(request.url, `http://${request.headers.host}`);
+    if (url.pathname.startsWith("/api/")) {
+      await handleApi(request, response, url);
+      return;
+    }
+    await handleStatic(response, url);
+  } catch (error) {
+    jsonResponse(response, error.statusCode || 500, { error: error.message || "Server error." });
+  }
+});
+
+loadData()
+  .then(() => {
+    server.listen(PORT, () => {
+      const provider = peerProviderStatus();
+      console.log(`TeachLab server listening on http://localhost:${PORT}`);
+      console.log(`Peer provider: ${provider.mode} (${provider.model})`);
+      if (OPENROUTER_API_KEY) console.log(`Arena judge: openrouter (${OPENROUTER_JUDGE_MODEL})`);
+    });
+  })
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });

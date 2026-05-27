@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TeachLab Classroom</title>
+    <script>
+      window.MathJax = {
+        tex: {
+          inlineMath: [
+            ["\\(", "\\)"],
+            ["$", "$"],
+          ],
+          displayMath: [
+            ["\\[", "\\]"],
+            ["$$", "$$"],
+          ],
+          processEscapes: true,
+        },
+        options: {
+          skipHtmlTags: ["script", "noscript", "style", "textarea", "pre", "code"],
+        },
+        startup: {
+          typeset: false,
+        },
+      };
+    </script>
+    <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace">
+        <aside class="role-panel" aria-label="Classroom access">
+          <div class="brand-lockup">
+            <div class="brand-mark" aria-hidden="true">
+              <span></span>
+              <span></span>
+              <span></span>
+            </div>
+            <div>
+              <p class="eyebrow">TeachLab</p>
+              <h1>Peer arena</h1>
+            </div>
+          </div>
+
+          <div class="role-tabs" role="tablist" aria-label="Choose role">
+            <button class="role-tab is-active" id="teacherTab" type="button" data-role="teacher" role="tab" aria-selected="true">
+              Teacher
+            </button>
+            <button class="role-tab" id="studentTab" type="button" data-role="student" role="tab" aria-selected="false">
+              Student
+            </button>
+          </div>
+
+          <form class="access-form" id="teacherForm">
+            <label>
+              Teacher name
+              <input id="teacherName" name="teacherName" type="text" autocomplete="name" required />
+            </label>
+            <button class="primary-action" id="teacherLoginButton" type="button">Teacher login</button>
+            <div class="classroom-picker is-hidden" id="classroomPicker">
+              <div class="panel-heading">
+                <h3>Your rooms</h3>
+                <span id="teacherIdentity">Signed out</span>
+              </div>
+              <div class="classroom-list" id="classroomList"></div>
+            </div>
+            <label>
+              Class title
+              <input id="classTitle" name="classTitle" type="text" required />
+            </label>
+            <label>
+              Peer AI behavior
+              <textarea id="systemPrompt" name="systemPrompt" rows="4" required></textarea>
+            </label>
+            <label>
+              Challenge level
+              <select id="peerChallenge" name="peerChallenge">
+                <option value="balanced" selected>Balanced questions</option>
+                <option value="gentle">Gentle scaffolding</option>
+                <option value="rigorous">Rigorous challenge</option>
+              </select>
+            </label>
+            <label>
+              Teaching objectives
+              <textarea id="objectives" name="objectives" rows="5" required></textarea>
+            </label>
+            <label>
+              Arena problems (problem | keywords | answer key | rubric)
+              <textarea id="testQuestions" name="testQuestions" rows="6" required></textarea>
+            </label>
+            <button class="primary-action" type="submit">Open new classroom</button>
+            <p class="form-note" id="teacherError" role="status" aria-live="polite"></p>
+          </form>
+
+          <form class="access-form is-hidden" id="studentForm">
+            <label>
+              Student name
+              <input id="studentName" name="studentName" type="text" autocomplete="name" required />
+            </label>
+            <label>
+              Classroom code
+              <input id="joinCode" name="joinCode" type="text" autocomplete="off" required />
+            </label>
+            <button class="primary-action" type="submit">Join classroom</button>
+            <p class="form-note" id="joinError" role="status" aria-live="polite"></p>
+          </form>
+        </aside>
+
+        <section class="main-stage">
+          <div class="empty-state" id="emptyState">
+            <div class="signal-card">
+              <div class="signal-lines" aria-hidden="true">
+                <span></span><span></span><span></span><span></span>
+              </div>
+              <p>Select a role</p>
+            </div>
+          </div>
+
+          <section class="teacher-view is-hidden" id="teacherView" aria-label="Teacher classroom dashboard">
+            <header class="room-header">
+              <div>
+                <p class="eyebrow">Live classroom</p>
+                <h2 id="teacherRoomTitle">Classroom</h2>
+              </div>
+              <div class="code-card">
+                <span>Class code</span>
+                <strong id="roomCode">------</strong>
+                <small id="teacherProvider">Peer: simulator</small>
+                <button class="ghost-action join-lock-button" id="joinLockButton" type="button" aria-pressed="false">Lock joins</button>
+                <button class="ghost-action join-lock-button" id="activityToggleButton" type="button" aria-pressed="false">Close activity</button>
+                <button class="ghost-action session-action" id="teacherSignOutButton" type="button">Sign out</button>
+              </div>
+            </header>
+
+            <div class="teacher-grid">
+              <section class="setup-panel">
+                <div class="panel-heading">
+                  <h3>Peer AI settings</h3>
+                  <button class="ghost-action" id="saveConfigButton" type="button">Save updates</button>
+                </div>
+                <label>
+                  Class title
+                  <input id="liveClassTitle" type="text" />
+                </label>
+                <label>
+                  Expected peer behavior
+                  <textarea id="liveSystemPrompt" rows="5"></textarea>
+                </label>
+                <label>
+                  Challenge level
+                  <select id="livePeerChallenge">
+                    <option value="balanced">Balanced questions</option>
+                    <option value="gentle">Gentle scaffolding</option>
+                    <option value="rigorous">Rigorous challenge</option>
+                  </select>
+                </label>
+                <label>
+                  Teaching objectives
+                  <textarea id="liveObjectives" rows="7"></textarea>
+                </label>
+                <label>
+                  Arena problems (problem | keywords | answer key | rubric)
+                  <textarea id="liveTestQuestions" rows="7"></textarea>
+                </label>
+              </section>
+
+              <section class="monitor-panel">
+                <div class="panel-heading">
+                  <h3>Student progress</h3>
+                  <span id="studentCount">0 active</span>
+                </div>
+                <div class="monitor-filters" id="monitorFilters" role="group" aria-label="Filter student progress">
+                  <button class="filter-chip is-active" type="button" data-filter="all">All</button>
+                  <button class="filter-chip" type="button" data-filter="readiness-open">Readiness open</button>
+                  <button class="filter-chip" type="button" data-filter="correction">Correction</button>
+                  <button class="filter-chip" type="button" data-filter="test-ready">Ranked</button>
+                </div>
+                <div class="class-summary" id="classSummary"></div>
+                <div class="arena-leaderboard" id="teacherLeaderboard"></div>
+                <div class="student-list" id="studentList"></div>
+              </section>
+            </div>
+          </section>
+
+          <section class="student-view is-hidden" id="studentView" aria-label="Student teaching workspace">
+            <header class="room-header">
+              <div>
+                <p class="eyebrow" id="studentRoomCode">Classroom</p>
+                <h2 id="studentRoomTitle">Teach your peer</h2>
+              </div>
+              <div class="student-status">
+                <span id="studentProvider">Peer: simulator</span>
+                <span id="studentScore">No score</span>
+                <button class="ghost-action" id="readinessCheckButton" type="button">Check readiness</button>
+                <button class="ghost-action" id="startTestButton" type="button">Enter arena</button>
+                <button class="ghost-action session-action" id="studentLeaveButton" type="button">Leave</button>
+              </div>
+            </header>
+
+            <div class="student-grid">
+              <section class="objective-panel">
+                <h3>Teaching objectives</h3>
+                <ul id="objectiveList"></ul>
+              </section>
+
+              <section class="chat-panel">
+                <div class="chat-log" id="chatLog" aria-live="polite"></div>
+                <form class="composer" id="chatForm">
+                  <textarea id="chatInput" rows="3" required></textarea>
+                  <button class="primary-action" id="chatSubmitButton" type="submit">Teach</button>
+                </form>
+              </section>
+
+              <section class="test-panel">
+                <div class="panel-heading">
+                  <h3>Arena</h3>
+                  <span id="testState">Waiting</span>
+                </div>
+                <div class="arena-leaderboard" id="studentLeaderboard"></div>
+                <div id="testResults" class="test-results"></div>
+              </section>
+            </div>
+          </section>
+        </section>
+      </section>
+    </main>
+    <script src="./app.js"></script>
+  </body>
+</html>
