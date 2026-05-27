@@ -45,19 +45,17 @@ PORT=4174 npm start
 
 ## Microsoft SSO
 
-For deployment, configure Microsoft Entra ID OpenID Connect values in `.env`:
+For deployment, student-teach uses the shared THIS Nexus Microsoft sign-in, matching the Incident app. The main site owns the Microsoft client and callback. Configure student-teach with the shared auth service values:
 
 ```bash
-PUBLIC_BASE_URL=https://student-teach.thisnexus.cn
+NEXT_PUBLIC_AUTH_BASE_URL=https://thisnexus.cn
+AUTH_BASE_URL=https://thisnexus.cn
+AUTH_SERVICE_BASE_URL=https://thisnexus.cn
+AUTH_COOKIE_NAME=thisnexus_session
 AUTH_COOKIE_DOMAIN=.thisnexus.cn
-AUTH_COOKIE_SECRET=use_a_long_random_secret
-MICROSOFT_TENANT_ID=your_tenant_id
-MICROSOFT_CLIENT_ID=your_app_client_id
-MICROSOFT_CLIENT_SECRET=your_app_client_secret
-MICROSOFT_REDIRECT_URI=https://student-teach.thisnexus.cn/auth/microsoft/callback
 ```
 
-Use `https://student-teach.thisnexus.cn/auth/microsoft/callback` as the app registration redirect URI. The app classifies Microsoft accounts with any digit in the email address as students; email addresses without digits are teachers. Auth cookies are scoped to `.thisnexus.cn` so the sign-on can be shared across `thisnexus.cn` subdomains.
+Sign-in redirects to `https://thisnexus.cn/api/auth/microsoft?returnTo=https://student-teach.thisnexus.cn/...`, then the app reads the shared `thisnexus_session` cookie. The app classifies Microsoft accounts with any digit in the email address as students; email addresses without digits are teachers. Auth cookies are scoped to `.thisnexus.cn` so sign-on can be shared across `thisnexus.cn` subdomains.
 
 When Microsoft SSO variables are not set, the app keeps the local prototype login behavior for development and tests.
 
