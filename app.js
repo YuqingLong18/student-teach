@@ -2,6 +2,8 @@ const SESSION_KEY = "teachlab.session.v1";
 
 const state = {
   role: "teacher",
+  authEnabled: false,
+  authUser: null,
   teacher: null,
   teacherSession: null,
   roomCode: null,
@@ -25,6 +27,7 @@ const elements = {
   classroomPicker: document.querySelector("#classroomPicker"),
   classroomList: document.querySelector("#classroomList"),
   studentForm: document.querySelector("#studentForm"),
+  studentLoginButton: document.querySelector("#studentLoginButton"),
   teacherError: document.querySelector("#teacherError"),
   joinError: document.querySelector("#joinError"),
   emptyState: document.querySelector("#emptyState"),
@@ -80,6 +83,52 @@ async function apiRequest(path, options = {}) {
   return payload;
 }
 
+async function loadAuthState() {
+  const payload = await apiRequest("/api/auth/me");
+  state.authEnabled = Boolean(payload.authEnabled);
+  state.authUser = payload.authenticated ? payload.user : null;
+
+  if (state.authUser?.role === "teacher" && state.authUser.teacher) {
+    state.teacher = state.authUser.teacher;
+    state.teacherSession = "microsoft-sso";
+  }
+
+  renderAuthAccess();
+}
+
+function beginMicrosoftSignIn(role) {
+  const returnTo = `${window.location.pathname}${window.location.search}`;
+  window.location.href = `/auth/microsoft/start?role=${encodeURIComponent(role)}&returnTo=${encodeURIComponent(returnTo)}`;
+}
+
+function renderAuthAccess() {
+  if (!state.authEnabled) {
+    elements.teacherLoginButton.textContent = "Teacher login";
+    elements.studentLoginButton.textContent = "Student login";
+    return;
+  }
+
+  const user = state.authUser;
+  elements.teacherLoginButton.classList.toggle("is-hidden", user?.role === "teacher");
+  elements.studentLoginButton.classList.toggle("is-hidden", user?.role === "student");
+
+  if (!user) {
+    elements.teacherIdentity.textContent = "Signed out";
+    elements.teacherError.textContent ||= "Sign in with your school Microsoft account.";
+    elements.joinError.textContent ||= "Sign in with your school Microsoft account.";
+    return;
+  }
+
+  if (user.role === "teacher") {
+    elements.teacherIdentity.textContent = `${user.name || user.email} · teacher`;
+    elements.teacherError.textContent = "";
+    if (state.role === "student") elements.joinError.textContent = "This Microsoft account is classified as a teacher account.";
+  } else {
+    elements.joinError.textContent = "";
+    if (state.role === "teacher") elements.teacherError.textContent = "This Microsoft account is classified as a student account.";
+  }
+}
+
 function teacherHeaders() {
   return {
     ...(state.teacherToken ? { "X-Teacher-Token": state.teacherToken } : {}),
@@ -127,13 +176,33 @@ function saveSession() {
 
 async function teacherLogin() {
   elements.teacherError.textContent = "";
+  if (state.authEnabled) {
+    if (!state.authUser) {
+      beginMicrosoftSignIn("teacher");
+      return;
+    }
+
+    if (state.authUser.role !== "teacher" || !state.authUser.teacher) {
+      elements.teacherError.textContent = "This Microsoft account is classified as a student account.";
+      return;
+    }
+
+    state.teacher = state.authUser.teacher;
+    state.teacherSession = "microsoft-sso";
+    renderTeacherIdentity();
+    await loadTeacherClassrooms();
+    return;
+  }
+
   const restore = setBusy(elements.teacherLoginButton, "Signing in...");
 
   try {
+    const teacherName = window.prompt("Teacher name");
+    if (!teacherName) return;
     const payload = await apiRequest("/api/teachers/login", {
       method: "POST",
       body: JSON.stringify({
-        teacherName: document.querySelector("#teacherName").value.trim(),
+        teacherName: teacherName.trim(),
       }),
     });
     state.teacher = payload.teacher;
@@ -154,12 +223,13 @@ async function teacherLogin() {
 }
 
 function renderTeacherIdentity() {
-  elements.teacherIdentity.textContent = state.teacher ? state.teacher.name : "Signed out";
+  const label = state.authUser?.role === "teacher" ? `${state.authUser.name || state.authUser.email} · teacher` : state.teacher?.name;
+  elements.teacherIdentity.textContent = label || "Signed out";
   elements.classroomPicker.classList.toggle("is-hidden", !state.teacher);
 }
 
 async function loadTeacherClassrooms() {
-  if (!state.teacher || !state.teacherSession) return;
+  if (!state.teacher || (!state.teacherSession && !state.authUser)) return;
   const payload = await apiRequest("/api/teachers/me/classrooms", { headers: teacherHeaders() });
   renderClassroomList(payload.classrooms || []);
 }
@@ -207,6 +277,7 @@ function clearSession() {
 
 function resetTeacherSession() {
   stopPolling();
+  state.authUser = null;
   state.teacher = null;
   state.teacherSession = null;
   state.teacherToken = null;
@@ -222,6 +293,7 @@ function resetTeacherSession() {
   elements.teacherError.textContent = "";
   showView("empty");
   setRole("teacher");
+  renderAuthAccess();
 }
 
 function resetStudentSession() {
@@ -236,6 +308,16 @@ function resetStudentSession() {
   elements.joinError.textContent = "";
   showView("empty");
   setRole("student");
+  renderAuthAccess();
+}
+
+async function signOut() {
+  try {
+    await apiRequest("/api/auth/logout", { method: "POST" });
+  } catch {
+    // Local cleanup still leaves the browser in a safe signed-out state for this app.
+  }
+  resetTeacherSession();
 }
 
 function loadSession() {
@@ -309,6 +391,7 @@ function setRole(role) {
   elements.studentTab.setAttribute("aria-selected", role === "student");
   elements.teacherForm.classList.toggle("is-hidden", role !== "teacher");
   elements.studentForm.classList.toggle("is-hidden", role !== "student");
+  renderAuthAccess();
 }
 
 function showView(view) {
@@ -890,6 +973,16 @@ elements.studentTab.addEventListener("click", () => setRole("student"));
 elements.teacherForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   elements.teacherError.textContent = "";
+  if (state.authEnabled) {
+    if (!state.authUser) {
+      beginMicrosoftSignIn("teacher");
+      return;
+    }
+    if (state.authUser.role !== "teacher") {
+      elements.teacherError.textContent = "This Microsoft account is classified as a student account.";
+      return;
+    }
+  }
   const restore = setBusy(event.submitter, "Opening...");
 
   try {
@@ -925,14 +1018,26 @@ elements.teacherForm.addEventListener("submit", async (event) => {
 elements.studentForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   elements.joinError.textContent = "";
+  if (state.authEnabled) {
+    if (!state.authUser) {
+      beginMicrosoftSignIn("student");
+      return;
+    }
+    if (state.authUser.role !== "student") {
+      elements.joinError.textContent = "This Microsoft account is classified as a teacher account.";
+      return;
+    }
+  }
   const restore = setBusy(event.submitter, "Joining...");
 
   try {
     const code = document.querySelector("#joinCode").value.trim().toUpperCase();
+    const fallbackName = state.authEnabled ? state.authUser.name || state.authUser.email : window.prompt("Student name");
+    if (!fallbackName) return;
     const payload = await apiRequest(`/api/classrooms/${encodeURIComponent(code)}/students`, {
       method: "POST",
       body: JSON.stringify({
-        name: document.querySelector("#studentName").value.trim(),
+        name: fallbackName,
       }),
     });
     state.room = payload.room;
@@ -952,6 +1057,7 @@ elements.studentForm.addEventListener("submit", async (event) => {
 });
 
 elements.teacherLoginButton.addEventListener("click", teacherLogin);
+elements.studentLoginButton.addEventListener("click", () => beginMicrosoftSignIn("student"));
 
 elements.saveConfigButton.addEventListener("click", async () => {
   if (!state.roomCode) return;
@@ -1033,7 +1139,7 @@ elements.activityToggleButton.addEventListener("click", async () => {
   }
 });
 
-elements.teacherSignOutButton.addEventListener("click", resetTeacherSession);
+elements.teacherSignOutButton.addEventListener("click", signOut);
 
 elements.chatForm.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -1122,19 +1228,40 @@ setRole("teacher");
 showView("empty");
 
 async function restoreSession() {
+  await loadAuthState();
+  const authError = new URLSearchParams(window.location.search).get("authError");
+  if (authError) {
+    elements.teacherError.textContent = authError;
+    elements.joinError.textContent = authError;
+  }
+
   const session = loadSession();
-  if (!session) return;
+  if (state.authEnabled && !state.authUser) {
+    clearSession();
+    return;
+  }
+
+  if (!session) {
+    if (state.authUser?.role === "teacher" && state.teacher) {
+      setRole("teacher");
+      renderTeacherIdentity();
+      await loadTeacherClassrooms();
+    } else if (state.authUser?.role === "student") {
+      setRole("student");
+    }
+    return;
+  }
 
   state.roomCode = session.roomCode || null;
-  state.teacher = session.teacher || null;
-  state.teacherSession = session.teacherSession || null;
+  state.teacher = state.authUser?.role === "teacher" ? state.authUser.teacher : session.teacher || null;
+  state.teacherSession = state.authUser?.role === "teacher" ? "microsoft-sso" : session.teacherSession || null;
   state.teacherToken = session.teacherToken || null;
   state.studentId = session.studentId || null;
   state.studentToken = session.studentToken || null;
 
-  if (session.role === "student" && state.studentId && state.studentToken) {
+  if (session.role === "student" && state.studentId && state.studentToken && (!state.authEnabled || state.authUser?.role === "student")) {
     setRole("student");
-  } else if (session.role === "teacher" && state.teacher && state.teacherSession) {
+  } else if (session.role === "teacher" && state.teacher && state.teacherSession && (!state.authEnabled || state.authUser?.role === "teacher")) {
     setRole("teacher");
     renderTeacherIdentity();
     await loadTeacherClassrooms();

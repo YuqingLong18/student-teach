@@ -26,12 +26,24 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "openai/gpt-4o-mini";
 const OPENROUTER_JUDGE_MODEL = process.env.OPENROUTER_JUDGE_MODEL || OPENROUTER_MODEL;
 const OPENROUTER_API_URL = process.env.OPENROUTER_API_URL || "https://openrouter.ai/api/v1/chat/completions";
+const MICROSOFT_TENANT_ID = process.env.MICROSOFT_TENANT_ID;
+const MICROSOFT_CLIENT_ID = process.env.MICROSOFT_CLIENT_ID;
+const MICROSOFT_CLIENT_SECRET = process.env.MICROSOFT_CLIENT_SECRET;
+const MICROSOFT_REDIRECT_URI = process.env.MICROSOFT_REDIRECT_URI;
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
+const AUTH_COOKIE_DOMAIN = process.env.AUTH_COOKIE_DOMAIN;
+const AUTH_COOKIE_SECRET = process.env.AUTH_COOKIE_SECRET || process.env.MICROSOFT_CLIENT_SECRET || "dev-auth-cookie-secret";
+const AUTH_COOKIE_NAME = "teachlab_auth";
+const OAUTH_COOKIE_NAME = "teachlab_oauth";
+const AUTH_SESSION_SECONDS = Number(process.env.AUTH_SESSION_SECONDS || 8 * 60 * 60);
 const PEER_CHALLENGE_LEVELS = new Set(["gentle", "balanced", "rigorous"]);
 
 let store = { teachers: {}, classrooms: {} };
 let lastTimestamp = 0;
 let saveQueue = Promise.resolve();
 const activeArenaAttempts = new Set();
+let microsoftDiscoveryCache = null;
+let microsoftJwksCache = null;
 
 function loadEnvFile(filePath) {
   if (!fsSync.existsSync(filePath)) return;
@@ -94,6 +106,11 @@ function jsonResponse(response, status, payload) {
 function textResponse(response, status, message) {
   response.writeHead(status, { "Content-Type": "text/plain; charset=utf-8" });
   response.end(message);
+}
+
+function redirectResponse(response, location) {
+  response.writeHead(302, { Location: location });
+  response.end();
 }
 
 async function parseJsonBody(request) {
@@ -185,6 +202,180 @@ function normalizePeerChallenge(value) {
   const error = new Error("peerChallenge must be gentle, balanced, or rigorous.");
   error.statusCode = 400;
   throw error;
+}
+
+function authEnabled() {
+  return Boolean(MICROSOFT_TENANT_ID && MICROSOFT_CLIENT_ID && MICROSOFT_CLIENT_SECRET);
+}
+
+function base64UrlEncode(value) {
+  return Buffer.from(value).toString("base64url");
+}
+
+function base64UrlDecode(value) {
+  return Buffer.from(value, "base64url").toString("utf8");
+}
+
+function signValue(value) {
+  return crypto.createHmac("sha256", AUTH_COOKIE_SECRET).update(value).digest("base64url");
+}
+
+function signedCookieValue(payload) {
+  const body = base64UrlEncode(JSON.stringify(payload));
+  return `${body}.${signValue(body)}`;
+}
+
+function verifySignedCookie(value) {
+  if (!value || !value.includes(".")) return null;
+  const [body, signature] = value.split(".");
+  const expected = signValue(body);
+  if (signature.length !== expected.length) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null;
+  try {
+    return JSON.parse(base64UrlDecode(body));
+  } catch {
+    return null;
+  }
+}
+
+function parseCookies(request) {
+  const cookies = {};
+  const header = request.headers.cookie || "";
+  for (const part of header.split(";")) {
+    const [name, ...rest] = part.trim().split("=");
+    if (!name || !rest.length) continue;
+    cookies[name] = decodeURIComponent(rest.join("="));
+  }
+  return cookies;
+}
+
+function cookieHeader(name, value, options = {}) {
+  const parts = [`${name}=${encodeURIComponent(value)}`, "Path=/", "HttpOnly", "SameSite=Lax"];
+  if (options.maxAge !== undefined) parts.push(`Max-Age=${options.maxAge}`);
+  if (options.domain) parts.push(`Domain=${options.domain}`);
+  if (options.secure !== false) parts.push("Secure");
+  return parts.join("; ");
+}
+
+function clearCookieHeader(name) {
+  return cookieHeader(name, "", {
+    maxAge: 0,
+    domain: AUTH_COOKIE_DOMAIN,
+    secure: isSecureCookie(),
+  });
+}
+
+function isSecureCookie() {
+  return PUBLIC_BASE_URL?.startsWith("https://") || Boolean(AUTH_COOKIE_DOMAIN);
+}
+
+function requestOrigin(request) {
+  const protocol = request.headers["x-forwarded-proto"] || "http";
+  return PUBLIC_BASE_URL || `${protocol}://${request.headers.host}`;
+}
+
+function microsoftRedirectUri(request) {
+  return MICROSOFT_REDIRECT_URI || `${requestOrigin(request)}/auth/microsoft/callback`;
+}
+
+function roleForEmail(email) {
+  return /\d/.test(email) ? "student" : "teacher";
+}
+
+function authSessionFromRequest(request) {
+  const session = verifySignedCookie(parseCookies(request)[AUTH_COOKIE_NAME]);
+  if (!session || !session.email || !session.role || Date.now() > Number(session.expiresAt || 0)) return null;
+  return session;
+}
+
+async function microsoftDiscovery() {
+  if (microsoftDiscoveryCache) return microsoftDiscoveryCache;
+  const url = `https://login.microsoftonline.com/${encodeURIComponent(MICROSOFT_TENANT_ID)}/v2.0/.well-known/openid-configuration`;
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Microsoft discovery failed with ${response.status}.`);
+  microsoftDiscoveryCache = await response.json();
+  return microsoftDiscoveryCache;
+}
+
+async function microsoftJwks() {
+  if (microsoftJwksCache) return microsoftJwksCache;
+  const discovery = await microsoftDiscovery();
+  const response = await fetch(discovery.jwks_uri);
+  if (!response.ok) throw new Error(`Microsoft JWKS fetch failed with ${response.status}.`);
+  microsoftJwksCache = await response.json();
+  return microsoftJwksCache;
+}
+
+function decodeJwtPart(token, index) {
+  const part = token.split(".")[index];
+  if (!part) throw new Error("Invalid ID token.");
+  return JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
+}
+
+async function verifyMicrosoftIdToken(idToken, nonce) {
+  const [headerPart, payloadPart, signaturePart] = idToken.split(".");
+  if (!headerPart || !payloadPart || !signaturePart) throw new Error("Invalid ID token.");
+
+  const header = decodeJwtPart(idToken, 0);
+  const claims = decodeJwtPart(idToken, 1);
+  const jwks = await microsoftJwks();
+  const key = jwks.keys.find((item) => item.kid === header.kid);
+  if (!key) throw new Error("Microsoft signing key not found.");
+
+  const verifier = crypto.createVerify("RSA-SHA256");
+  verifier.update(`${headerPart}.${payloadPart}`);
+  verifier.end();
+  const validSignature = verifier.verify(crypto.createPublicKey({ key, format: "jwk" }), Buffer.from(signaturePart, "base64url"));
+  if (!validSignature) throw new Error("Invalid Microsoft ID token signature.");
+
+  const discovery = await microsoftDiscovery();
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  if (claims.iss !== discovery.issuer) throw new Error("Invalid Microsoft token issuer.");
+  if (claims.aud !== MICROSOFT_CLIENT_ID) throw new Error("Invalid Microsoft token audience.");
+  if (claims.exp <= nowSeconds || Number(claims.nbf || 0) > nowSeconds + 60) throw new Error("Expired Microsoft ID token.");
+  if (claims.nonce !== nonce) throw new Error("Invalid Microsoft login nonce.");
+
+  const email = String(claims.preferred_username || claims.email || claims.upn || "").toLowerCase();
+  if (!email || !email.includes("@")) throw new Error("Microsoft account did not include an email address.");
+  return {
+    email,
+    name: String(claims.name || email),
+    oid: claims.oid,
+    role: roleForEmail(email),
+  };
+}
+
+function getOrCreateTeacherFromAuth(user) {
+  const id = teacherIdForName(user.email);
+  const existing = store.teachers[id];
+  if (!existing) {
+    store.teachers[id] = {
+      id,
+      name: user.name || user.email,
+      email: user.email,
+      sessionToken: crypto.randomUUID(),
+      createdAt: now(),
+      updatedAt: now(),
+    };
+  } else {
+    existing.name = user.name || existing.name || user.email;
+    existing.email = user.email;
+    existing.updatedAt = now();
+  }
+  return store.teachers[id];
+}
+
+function publicAuthUser(session) {
+  if (!session) return null;
+  const user = {
+    email: session.email,
+    name: session.name,
+    role: session.role,
+  };
+  if (session.role === "teacher" && session.teacherId && store.teachers[session.teacherId]) {
+    user.teacher = publicTeacher(store.teachers[session.teacherId]);
+  }
+  return user;
 }
 
 function generateCode() {
@@ -283,6 +474,17 @@ function publicTeacher(teacher) {
 }
 
 function requireTeacherSession(request) {
+  if (authEnabled()) {
+    const session = authSessionFromRequest(request);
+    if (session?.role === "teacher" && session.teacherId && store.teachers[session.teacherId]) {
+      return store.teachers[session.teacherId];
+    }
+
+    const error = new Error("Teacher Microsoft sign-in is required.");
+    error.statusCode = 401;
+    throw error;
+  }
+
   const teacherId = request.headers["x-teacher-id"];
   const token = request.headers["x-teacher-session"];
   const teacher = teacherId ? store.teachers[teacherId] : null;
@@ -977,6 +1179,15 @@ function requireTeacherAccess(request, room) {
 }
 
 function requireStudentToken(request, student) {
+  if (authEnabled()) {
+    const session = authSessionFromRequest(request);
+    if (session?.role !== "student" || student.email !== session.email) {
+      const error = new Error("Student Microsoft sign-in is required for this workspace.");
+      error.statusCode = 401;
+      throw error;
+    }
+  }
+
   const token = request.headers["x-student-token"];
   if (!student.studentToken || token !== student.studentToken) {
     const error = new Error("Student session is required for this workspace.");
@@ -1017,10 +1228,131 @@ function arenaAttemptKey(room, student) {
   return `${room.code}:${student.id}`;
 }
 
+async function handleAuth(request, response, url) {
+  if (!authEnabled()) return textResponse(response, 503, "Microsoft SSO is not configured.");
+
+  if (request.method === "GET" && url.pathname === "/auth/microsoft/start") {
+    const discovery = await microsoftDiscovery();
+    const state = crypto.randomUUID();
+    const nonce = crypto.randomUUID();
+    const returnTo = url.searchParams.get("returnTo") || "/";
+    const expectedRole = url.searchParams.get("role") || "";
+    const oauthCookie = signedCookieValue({
+      state,
+      nonce,
+      returnTo: returnTo.startsWith("/") ? returnTo : "/",
+      expectedRole,
+      expiresAt: Date.now() + 10 * 60 * 1000,
+    });
+    const authUrl = new URL(discovery.authorization_endpoint);
+    authUrl.searchParams.set("client_id", MICROSOFT_CLIENT_ID);
+    authUrl.searchParams.set("response_type", "code");
+    authUrl.searchParams.set("redirect_uri", microsoftRedirectUri(request));
+    authUrl.searchParams.set("response_mode", "query");
+    authUrl.searchParams.set("scope", "openid profile email");
+    authUrl.searchParams.set("state", state);
+    authUrl.searchParams.set("nonce", nonce);
+    response.writeHead(302, {
+      Location: authUrl.toString(),
+      "Set-Cookie": cookieHeader(OAUTH_COOKIE_NAME, oauthCookie, {
+        maxAge: 10 * 60,
+        domain: AUTH_COOKIE_DOMAIN,
+        secure: isSecureCookie(),
+      }),
+    });
+    response.end();
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/auth/microsoft/callback") {
+    const oauthSession = verifySignedCookie(parseCookies(request)[OAUTH_COOKIE_NAME]);
+    if (!oauthSession || Date.now() > Number(oauthSession.expiresAt || 0) || oauthSession.state !== url.searchParams.get("state")) {
+      return redirectResponse(response, "/?authError=invalid-signin");
+    }
+
+    if (url.searchParams.get("error")) {
+      return redirectResponse(response, `/?authError=${encodeURIComponent(url.searchParams.get("error_description") || url.searchParams.get("error"))}`);
+    }
+
+    const discovery = await microsoftDiscovery();
+    const params = new URLSearchParams({
+      client_id: MICROSOFT_CLIENT_ID,
+      client_secret: MICROSOFT_CLIENT_SECRET,
+      grant_type: "authorization_code",
+      code: requireString(url.searchParams.get("code"), "code"),
+      redirect_uri: microsoftRedirectUri(request),
+      scope: "openid profile email",
+    });
+    const tokenResponse = await fetch(discovery.token_endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: params,
+    });
+    const tokenPayload = await tokenResponse.json().catch(() => ({}));
+    if (!tokenResponse.ok) {
+      console.error("Microsoft token exchange failed:", tokenPayload.error || tokenResponse.status);
+      return redirectResponse(response, "/?authError=token-exchange-failed");
+    }
+
+    const user = await verifyMicrosoftIdToken(tokenPayload.id_token, oauthSession.nonce);
+    const teacher = user.role === "teacher" ? getOrCreateTeacherFromAuth(user) : null;
+    if (teacher) await saveData();
+
+    const sessionCookie = signedCookieValue({
+      email: user.email,
+      name: user.name,
+      role: user.role,
+      oid: user.oid,
+      teacherId: teacher?.id,
+      expiresAt: Date.now() + AUTH_SESSION_SECONDS * 1000,
+    });
+    response.writeHead(302, {
+      Location: oauthSession.returnTo || "/",
+      "Set-Cookie": [
+        cookieHeader(AUTH_COOKIE_NAME, sessionCookie, {
+          maxAge: AUTH_SESSION_SECONDS,
+          domain: AUTH_COOKIE_DOMAIN,
+          secure: isSecureCookie(),
+        }),
+        clearCookieHeader(OAUTH_COOKIE_NAME),
+      ],
+    });
+    response.end();
+    return;
+  }
+
+  return textResponse(response, 404, "Auth route not found");
+}
+
 async function handleApi(request, response, url) {
   const parts = url.pathname.split("/").filter(Boolean);
 
+  if (request.method === "GET" && url.pathname === "/api/auth/me") {
+    const session = authEnabled() ? authSessionFromRequest(request) : null;
+    return jsonResponse(response, 200, {
+      authEnabled: authEnabled(),
+      authenticated: Boolean(session),
+      user: publicAuthUser(session),
+    });
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/auth/logout") {
+    response.writeHead(200, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Set-Cookie": [clearCookieHeader(AUTH_COOKIE_NAME), clearCookieHeader(OAUTH_COOKIE_NAME)],
+    });
+    response.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
   if (request.method === "POST" && url.pathname === "/api/teachers/login") {
+    if (authEnabled()) {
+      const error = new Error("Use Microsoft sign-in for teacher login.");
+      error.statusCode = 400;
+      throw error;
+    }
+
     const body = await parseJsonBody(request);
     const teacher = getOrCreateTeacher(body.teacherName);
     await saveData();
@@ -1121,11 +1453,18 @@ async function handleApi(request, response, url) {
     }
 
     const body = await parseJsonBody(request);
-    const name = requireString(body.name, "name");
+    const authSession = authEnabled() ? authSessionFromRequest(request) : null;
+    if (authEnabled() && authSession?.role !== "student") {
+      const error = new Error("Student Microsoft sign-in is required.");
+      error.statusCode = 401;
+      throw error;
+    }
+    const name = authSession ? authSession.name || authSession.email : requireString(body.name, "name");
     const studentId = crypto.randomUUID();
     room.students[studentId] = {
       id: studentId,
       name,
+      email: authSession?.email,
       status: "Teaching",
       messages: [
         {
@@ -1262,6 +1601,10 @@ async function handleStatic(response, url) {
 const server = http.createServer(async (request, response) => {
   try {
     const url = new URL(request.url, `http://${request.headers.host}`);
+    if (url.pathname.startsWith("/auth/")) {
+      await handleAuth(request, response, url);
+      return;
+    }
     if (url.pathname.startsWith("/api/")) {
       await handleApi(request, response, url);
       return;
