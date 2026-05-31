@@ -7,10 +7,10 @@ This is a browser prototype plus a small dependency-free Node backend for the cl
 - Teacher logs in by name and can reopen classrooms owned by that teacher.
 - Teacher opens a classroom instance and receives a classroom code.
 - The teacher browser receives a private session token for monitoring and configuration.
-- Teacher configures the class title, peer AI behavior, challenge level, teaching objectives, and arena problems.
+- Teacher configures the class title, peer AI behavior, challenge level, teaching objectives, arena problems, and a matching line-by-line Keys field.
 - Teacher can lock or unlock new student joins for an active classroom.
 - Teacher can close or resume student activity while keeping monitoring available.
-- Arena problem lines support `problem | keywords | answer key | rubric`; the answer key and rubric are optional and are hidden from students.
+- Arena problem lines support `problem | keywords | rubric`; hidden answer keys are entered separately in `Keys`, one key per problem.
 - Student joins with the classroom code.
 - The student browser receives a private session token for its own chat and arena workspace.
 - Student teaches a peer LLM through one chat thread.
@@ -84,6 +84,16 @@ OPENROUTER_JUDGE_MODEL=openai/gpt-4o-mini
 ```
 
 When `OPENROUTER_API_KEY` is present, peer chat replies, readiness checks, arena answers, and arena answer judging are generated through OpenRouter's chat completions API. The judge model must answer each arena grading request with only `correct` or `incorrect`; if `OPENROUTER_JUDGE_MODEL` is not set, the app uses `OPENROUTER_MODEL` for judging too. Without `OPENROUTER_API_KEY`, the server falls back to deterministic local peer behavior.
+
+## Polynomial Simulation
+
+With the server running and `OPENROUTER_API_KEY` configured, run the real-LLM polynomial classroom simulation:
+
+```bash
+npm run simulate:polynomials
+```
+
+The script creates a classroom, joins 10 simulated students concurrently, coaches the peer LLM with varied instruction quality, submits arena attempts, and writes markdown/JSON reports under `reports/`. It fails if the server is using the local simulator unless `SIM_ALLOW_SIMULATOR=true` is set.
 
 ## Important Next Steps
 

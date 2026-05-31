@@ -191,6 +191,33 @@ function normalizeQuestions(value) {
   return normalized;
 }
 
+function normalizeAnswerKeys(value, questionCount) {
+  if (value === undefined || value === null || value === "") return null;
+
+  const keys = Array.isArray(value)
+    ? value.map((line) => String(line).trim())
+    : String(value)
+        .split("\n")
+        .map((line) => line.trim());
+
+  if (keys.length !== questionCount || keys.some((key) => !key)) {
+    const error = new Error(`answerKeys must include exactly ${questionCount} non-empty item${questionCount === 1 ? "" : "s"}.`);
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return keys;
+}
+
+function applyAnswerKeys(questions, answerKeys) {
+  const keys = normalizeAnswerKeys(answerKeys, questions.length);
+  if (!keys) return questions;
+  return questions.map((question, index) => ({
+    ...question,
+    expectedAnswer: keys[index],
+  }));
+}
+
 function normalizePeerChallenge(value) {
   const level = String(value || "balanced")
     .trim()
@@ -680,7 +707,7 @@ function isNotSureFinalAnswer(finalAnswer) {
   return /^not sure what to do\.?$/i.test(finalAnswer.trim());
 }
 
-async function judgeArenaAnswer(question, answer, transcript) {
+async function judgeArenaAnswer(question, answer) {
   const finalAnswer = extractFinalAnswer(answer);
   if (!finalAnswer || isNotSureFinalAnswer(finalAnswer)) return false;
 
@@ -689,18 +716,18 @@ async function judgeArenaAnswer(question, answer, transcript) {
     temperature: 0,
     maxOutputTokens: 4,
     system: [
-      "You are a strict math classroom answer judge.",
-      "Grade only the peer's final answer.",
-      "Mark correct only if the final answer is mathematically correct and the required method or fact is supported by the student teaching transcript.",
-      "Mark incorrect if the final answer is wrong, incomplete, unsupported by the student teaching transcript, or not actually an answer to the problem.",
+      "You are a strict classroom answer judge.",
+      "Grade only whether the peer response leads to the teacher answer key.",
+      "Mark correct if the peer's final answer is equivalent to the key, allowing harmless wording or notation differences.",
+      "Mark incorrect if the final answer is wrong, incomplete, not supported by the peer's reasoning, or not actually an answer to the problem.",
       "Reply with exactly one lowercase word: correct or incorrect.",
     ].join("\n"),
     user: [
-      `Student teaching and coaching transcript:\n${transcript || "The student has not taught anything yet."}`,
       `Arena problem:\n${question.prompt}`,
-      question.expectedAnswer ? `Teacher answer key:\n${question.expectedAnswer}` : "",
+      question.expectedAnswer ? `Teacher answer key:\n${question.expectedAnswer}` : "Teacher answer key:\nNo key was provided. Use the required concepts as the scoring target.",
       question.rubric ? `Teacher rubric:\n${question.rubric}` : "",
       question.keywords.length ? `Required concepts or answer markers:\n${question.keywords.join(", ")}` : "",
+      `Peer response:\n${answer}`,
       `Peer final answer:\n${finalAnswer}`,
       "Decision:",
     ]
@@ -808,10 +835,10 @@ async function createTestAnswer(room, student, question, transcript) {
         mathFormattingInstruction(),
         "You are now entering the classroom arena as the student's trained peer LLM.",
         "Use only the methods, concepts, and explanations the student teacher taught you.",
-        "If the student teacher did not teach enough, attempt the problem honestly and say what you are unsure about.",
+        "Respond with one short paragraph of reasoning followed by exactly one final answer line.",
+        "The reasoning paragraph must be under 90 words and must not use bullet points.",
         "End every arena response with exactly one final line in this format: final answer: <your answer>.",
         "If you cannot solve it from what the student taught you, the final line must be exactly: final answer: not sure what to do.",
-        "Keep the answer concise.",
       ].join("\n\n"),
       user: [
         `Student teaching and coaching transcript:\n${transcript || "The student has not taught anything yet."}`,
@@ -821,7 +848,7 @@ async function createTestAnswer(room, student, question, transcript) {
         .join("\n\n"),
       maxOutputTokens: 220,
     });
-    const correct = await judgeArenaAnswer(question, answer, transcript);
+    const correct = await judgeArenaAnswer(question, answer);
 
     return {
       answer,
@@ -1266,6 +1293,7 @@ async function handleApi(request, response, url) {
   if (request.method === "POST" && url.pathname === "/api/classrooms") {
     const teacher = requireTeacherSession(request);
     const body = await parseJsonBody(request);
+    const testQuestions = applyAnswerKeys(normalizeQuestions(body.testQuestions), body.answerKeys);
     const code = generateCode();
     const room = {
       code,
@@ -1275,7 +1303,7 @@ async function handleApi(request, response, url) {
       systemPrompt: requireString(body.systemPrompt, "systemPrompt"),
       peerChallenge: normalizePeerChallenge(body.peerChallenge),
       objectives: normalizeLines(body.objectives, "objectives"),
-      testQuestions: normalizeQuestions(body.testQuestions),
+      testQuestions,
       joinLocked: false,
       activityClosed: false,
       students: {},
@@ -1307,7 +1335,7 @@ async function handleApi(request, response, url) {
     room.systemPrompt = requireString(body.systemPrompt, "systemPrompt");
     room.peerChallenge = normalizePeerChallenge(body.peerChallenge || room.peerChallenge);
     room.objectives = normalizeLines(body.objectives, "objectives");
-    room.testQuestions = normalizeQuestions(body.testQuestions);
+    room.testQuestions = applyAnswerKeys(normalizeQuestions(body.testQuestions), body.answerKeys);
     room.updatedAt = now();
     await saveData();
     return jsonResponse(response, 200, { room: summarizeRoom(room) });

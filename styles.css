@@ -572,6 +572,44 @@ textarea:focus {
   padding: 14px;
 }
 
+.student-monitor-card {
+  padding: 0;
+}
+
+.student-monitor-card summary {
+  display: block;
+  padding: 14px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.student-monitor-card summary::-webkit-details-marker {
+  display: none;
+}
+
+.student-monitor-card summary:focus-visible {
+  outline: 3px solid rgba(50, 116, 91, 0.2);
+  outline-offset: -3px;
+}
+
+.student-card-main {
+  display: grid;
+  gap: 10px;
+}
+
+.student-card-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+
+.student-card-note {
+  color: var(--muted);
+  font-size: 0.86rem;
+  line-height: 1.4;
+}
+
 .student-card header,
 .result-card header {
   display: flex;
@@ -608,6 +646,7 @@ textarea:focus {
 }
 
 .metric {
+  display: block;
   border-left: 4px solid var(--green);
   background: rgba(50, 116, 91, 0.07);
   padding: 8px;
@@ -649,7 +688,7 @@ textarea:focus {
 }
 
 .student-detail {
-  margin-top: 12px;
+  margin: 0 14px 14px;
   border-top: 1.5px solid var(--line);
   padding-top: 10px;
 }

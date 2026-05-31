@@ -102,7 +102,9 @@ async function createClassroom(baseUrl, login, overrides = {}) {
       "Describe momentum transfer using impulse",
     ],
     testQuestions:
-      "How does speed change kinetic energy? | kinetic, velocity\nHow does impulse affect momentum transfer? | impulse, momentum | Impulse changes momentum during a transfer. | Mention force over time and momentum change.",
+      "How does speed change kinetic energy? | kinetic, velocity | Mention the square relationship to speed.\nHow does impulse affect momentum transfer? | impulse, momentum | Mention force over time and momentum change.",
+    answerKeys:
+      "Kinetic energy changes with the square of speed.\nImpulse changes momentum during a transfer.",
     ...overrides,
   };
   const { response, payload } = await request(baseUrl, "POST", "/api/classrooms", body, teacherHeaders(login));
@@ -211,7 +213,9 @@ test("teacher login, room ownership, student teaching, testing, correction, and 
       peerChallenge: "gentle",
       objectives: "Explain kinetic energy using mass and velocity\nDescribe momentum transfer using impulse",
       testQuestions:
-        "How does speed change kinetic energy? | kinetic, velocity\nHow does impulse affect momentum transfer? | impulse, momentum | Impulse changes momentum during a transfer. | Mention force over time and momentum change.",
+        "How does speed change kinetic energy? | kinetic, velocity | Mention the square relationship to speed.\nHow does impulse affect momentum transfer? | impulse, momentum | Mention force over time and momentum change.",
+      answerKeys:
+        "Kinetic energy changes with the square of speed.\nImpulse changes momentum during a transfer.",
     },
     teacherHeaders(teacher),
   );
@@ -229,6 +233,7 @@ test("teacher login, room ownership, student teaching, testing, correction, and 
   assert.equal(join.payload.room.systemPrompt, undefined);
   assert.equal(join.payload.room.testQuestions[0].keywords, undefined);
   assert.equal(join.payload.room.testQuestions[1].expectedAnswer, undefined);
+  assert.equal(join.payload.room.testQuestions[1].rubric, undefined);
 
   const studentId = join.payload.student.id;
   const token = join.payload.studentToken;
@@ -370,4 +375,6 @@ test("teacher login, room ownership, student teaching, testing, correction, and 
   assert.equal(teacherMonitor.payload.room.students[0].attemptHistory.length, 2);
   assert.equal(teacherMonitor.payload.room.students[0].attemptHistory[0].results[1].correct, false);
   assert.equal(teacherMonitor.payload.room.students[0].attemptHistory[1].results[1].correct, true);
+  assert.equal(teacherMonitor.payload.room.testQuestions[0].expectedAnswer, "Kinetic energy changes with the square of speed.");
+  assert.equal(teacherMonitor.payload.room.testQuestions[1].expectedAnswer, "Impulse changes momentum during a transfer.");
 });

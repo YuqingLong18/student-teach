@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "check": "node --check server.js && node --check app.js",
-    "test": "node --test"
+    "test": "node --test",
+    "simulate:polynomials": "node scripts/run-polynomial-simulation.js"
   }
 }

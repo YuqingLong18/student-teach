@@ -44,6 +44,7 @@ const elements = {
   livePeerChallenge: document.querySelector("#livePeerChallenge"),
   liveObjectives: document.querySelector("#liveObjectives"),
   liveTestQuestions: document.querySelector("#liveTestQuestions"),
+  liveAnswerKeys: document.querySelector("#liveAnswerKeys"),
   saveConfigButton: document.querySelector("#saveConfigButton"),
   studentCount: document.querySelector("#studentCount"),
   monitorFilters: document.querySelector("#monitorFilters"),
@@ -337,11 +338,13 @@ function parseLines(value) {
 
 function parseTestQuestions(value) {
   return parseLines(value).map((line, index) => {
-    const [prompt, keywords = "", expectedAnswer = "", rubric = ""] = line.split("|").map((part) => part.trim());
+    const parts = line.split("|").map((part) => part.trim());
+    const prompt = parts[0] || "";
+    const keywords = parts[1] || "";
+    const rubric = parts.length > 3 ? parts[3] : parts[2] || "";
     return {
       id: `q-${index + 1}`,
       prompt,
-      expectedAnswer,
       rubric,
       keywords: keywords
         .split(",")
@@ -355,11 +358,14 @@ function serializeTestQuestions(questions) {
   return questions
     .map((question) => {
       const parts = [question.prompt, question.keywords.join(", ")];
-      if (question.expectedAnswer || question.rubric) parts.push(question.expectedAnswer || "");
       if (question.rubric) parts.push(question.rubric);
       return parts.join(" | ");
     })
     .join("\n");
+}
+
+function serializeAnswerKeys(questions) {
+  return questions.map((question) => question.expectedAnswer || "").join("\n");
 }
 
 function scoreLatestTest(room, student) {
@@ -447,7 +453,8 @@ function maybeUpdateConfigFields(room) {
     focused === elements.liveSystemPrompt ||
     focused === elements.livePeerChallenge ||
     focused === elements.liveObjectives ||
-    focused === elements.liveTestQuestions;
+    focused === elements.liveTestQuestions ||
+    focused === elements.liveAnswerKeys;
 
   if (isEditingConfig) return;
   elements.liveClassTitle.value = room.title;
@@ -455,6 +462,7 @@ function maybeUpdateConfigFields(room) {
   elements.livePeerChallenge.value = room.peerChallenge || "balanced";
   elements.liveObjectives.value = room.objectives.join("\n");
   elements.liveTestQuestions.value = serializeTestQuestions(room.testQuestions);
+  elements.liveAnswerKeys.value = serializeAnswerKeys(room.testQuestions);
 }
 
 function renderTeacher(room) {
@@ -501,24 +509,32 @@ function renderTeacher(room) {
   filteredStudents.forEach((student) => {
     const latest = student.latestScore;
     const status = displayStatus(student.status);
-    const card = document.createElement("article");
-    card.className = "student-card";
+    const card = document.createElement("details");
+    card.className = "student-card student-monitor-card";
     card.innerHTML = `
-      <header>
-        <strong>${escapeHtml(student.name)}</strong>
-        <span class="status-chip ${student.status === "Needs correction" ? "review" : student.status === "Arena ranked" || student.status === "Test ready" ? "ready" : ""}">${status}</span>
-      </header>
-      <div class="metric-row">
-        <div class="metric"><strong>${student.teachingTurns}</strong><span>teach turns</span></div>
-        <div class="metric"><strong>${student.objectiveCoverage}%</strong><span>coverage</span></div>
-        <div class="metric"><strong>${latest ? `${latest.correct}/${latest.total}` : "0/0"}</strong><span>arena</span></div>
-      </div>
-      ${
-        student.correctionTurns
-          ? `<div class="correction-strip"><strong>${student.correctionTurns}</strong><span>coaching turns after arena</span></div>`
-          : ""
-      }
-      <p class="form-note">${latest ? `Arena score: ${latest.percent}%. ${latest.percent < 100 ? "Coach and resubmit." : "Top score reached."}` : "No arena submission yet."}</p>
+      <summary>
+        <span class="student-card-main">
+          <span class="student-card-header">
+            <strong>${escapeHtml(student.name)}</strong>
+            <span class="status-chip ${
+              student.status === "Needs correction" ? "review" : student.status === "Arena ranked" || student.status === "Test ready" ? "ready" : ""
+            }">${status}</span>
+          </span>
+          <span class="metric-row">
+            <span class="metric"><strong>${student.teachingTurns + student.peerTurns}</strong><span>conversation rounds</span></span>
+            <span class="metric"><strong>${student.objectiveCoverage}%</strong><span>coverage</span></span>
+            <span class="metric"><strong>${latest ? `${latest.correct}/${latest.total}` : "0/0"}</strong><span>latest arena</span></span>
+          </span>
+          <span class="student-card-note">${
+            latest ? `Arena attempt ${student.testAttempts}: ${latest.percent}%. ${latest.percent < 100 ? "Needs targeted coaching." : "Ready for extension."}` : "No arena submission yet."
+          }</span>
+          ${
+            student.correctionTurns
+              ? `<span class="correction-strip"><strong>${student.correctionTurns}</strong><span>coaching turns after arena</span></span>`
+              : ""
+          }
+        </span>
+      </summary>
       ${renderTeacherStudentDetails(student)}
     `;
     elements.studentList.append(card);
@@ -597,8 +613,7 @@ function renderTeacherStudentDetails(student) {
   const readinessChecks = student.readinessHistory || [];
 
   return `
-    <details class="student-detail">
-      <summary>Review full progress</summary>
+    <div class="student-detail">
       ${renderObjectiveProgress(student.objectiveProgress || [])}
       ${
         missing.length
@@ -608,7 +623,7 @@ function renderTeacherStudentDetails(student) {
       ${renderReadinessHistory(readinessChecks)}
       ${renderAttemptHistory(attempts)}
       ${renderMessageHistory(messages)}
-    </details>
+    </div>
   `;
 }
 
@@ -995,6 +1010,7 @@ elements.teacherForm.addEventListener("submit", async (event) => {
         peerChallenge: document.querySelector("#peerChallenge").value,
         objectives: parseLines(document.querySelector("#objectives").value),
         testQuestions: parseTestQuestions(document.querySelector("#testQuestions").value),
+        answerKeys: parseLines(document.querySelector("#answerKeys").value),
       }),
     });
     state.room = payload.room;
@@ -1074,6 +1090,7 @@ elements.saveConfigButton.addEventListener("click", async () => {
         peerChallenge: elements.livePeerChallenge.value,
         objectives: parseLines(elements.liveObjectives.value),
         testQuestions: parseTestQuestions(elements.liveTestQuestions.value),
+        answerKeys: parseLines(elements.liveAnswerKeys.value),
       }),
     });
     state.room = payload.room;
