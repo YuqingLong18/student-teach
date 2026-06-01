@@ -463,8 +463,8 @@ function publicTeacher(teacher) {
 function requireTeacherSession(request) {
   if (authEnabled()) {
     const session = authSessionFromRequest(request);
-    if (session?.role === "teacher" && session.teacherId && store.teachers[session.teacherId]) {
-      return store.teachers[session.teacherId];
+    if (session?.role === "teacher") {
+      return session.teacherId && store.teachers[session.teacherId] ? store.teachers[session.teacherId] : getOrCreateTeacherFromAuth(session);
     }
 
     const error = new Error("Teacher Microsoft sign-in is required.");

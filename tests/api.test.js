@@ -1,11 +1,12 @@
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 
-async function startServer(t) {
+async function startServer(t, envOverrides = {}) {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "teachlab-api-"));
   const dataFile = path.join(tempDir, "classrooms.json");
   const port = 45000 + Math.floor(Math.random() * 10000);
@@ -16,6 +17,7 @@ async function startServer(t) {
       DATA_FILE: dataFile,
       PORT: String(port),
       OPENROUTER_API_KEY: "",
+      ...envOverrides,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -43,6 +45,20 @@ async function startServer(t) {
   return {
     baseUrl: `http://localhost:${port}`,
   };
+}
+
+function base64UrlEncode(value) {
+  return Buffer.from(value)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function signedSessionCookie(payload, secret) {
+  const body = base64UrlEncode(JSON.stringify(payload));
+  const signature = base64UrlEncode(crypto.createHmac("sha256", secret).update(body).digest());
+  return `${body}.${signature}`;
 }
 
 async function waitForServer(baseUrl, checkProcess) {
@@ -377,4 +393,56 @@ test("teacher login, room ownership, student teaching, testing, correction, and 
   assert.equal(teacherMonitor.payload.room.students[0].attemptHistory[1].results[1].correct, true);
   assert.equal(teacherMonitor.payload.room.testQuestions[0].expectedAnswer, "Kinetic energy changes with the square of speed.");
   assert.equal(teacherMonitor.payload.room.testQuestions[1].expectedAnswer, "Impulse changes momentum during a transfer.");
+});
+
+test("microsoft teacher session can create and list classrooms", async (t) => {
+  const authSecret = "test-auth-secret";
+  const cookieName = "thisnexus_session";
+  const { baseUrl } = await startServer(t, {
+    AUTH_BASE_URL: "https://thisnexus.cn",
+    AUTH_SERVICE_BASE_URL: "https://thisnexus.cn",
+    AUTH_COOKIE_NAME: cookieName,
+    AUTH_SESSION_SECRET: authSecret,
+  });
+  const cookie = signedSessionCookie(
+    {
+      email: "teacher@example.edu",
+      name: "Teacher Example",
+      role: "teacher",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    },
+    authSecret,
+  );
+  const headers = {
+    Cookie: `${cookieName}=${encodeURIComponent(cookie)}`,
+  };
+
+  const me = await request(baseUrl, "GET", "/api/auth/me", null, headers);
+  assert.equal(me.response.status, 200);
+  assert.equal(me.payload.authenticated, true);
+  assert.equal(me.payload.user.teacher.name, "Teacher Example");
+
+  const created = await request(
+    baseUrl,
+    "POST",
+    "/api/classrooms",
+    {
+      title: "SSO classroom",
+      systemPrompt: "Act as a peer learner.",
+      peerChallenge: "balanced",
+      objectives: ["Explain the Remainder Theorem"],
+      testQuestions: "What is the remainder if f(2)=5 and the divisor is x-2? | f(2), x-2 | Use Remainder Theorem.",
+      answerKeys: ["5"],
+    },
+    headers,
+  );
+  assert.equal(created.response.status, 201);
+  assert.equal(created.payload.room.teacherName, "Teacher Example");
+
+  const list = await request(baseUrl, "GET", "/api/teachers/me/classrooms", null, headers);
+  assert.equal(list.response.status, 200);
+  assert.deepEqual(
+    list.payload.classrooms.map((room) => room.code),
+    [created.payload.room.code],
+  );
 });
