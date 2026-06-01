@@ -14,6 +14,7 @@ const state = {
   student: null,
   pollTimer: null,
   monitorFilter: "all",
+  openStudentCards: new Set(),
   chatScrollTouchedAt: 0,
   isRestoringChatScroll: false,
 };
@@ -257,6 +258,7 @@ function renderClassroomList(classrooms) {
 }
 
 async function resumeTeacherRoom(room) {
+  if (state.roomCode !== room.code) state.openStudentCards.clear();
   state.roomCode = room.code;
   state.studentId = null;
   state.studentToken = null;
@@ -288,6 +290,7 @@ function resetTeacherSession() {
   state.studentToken = null;
   state.student = null;
   state.monitorFilter = "all";
+  state.openStudentCards.clear();
   clearSession();
   renderTeacherIdentity();
   elements.classroomList.innerHTML = "";
@@ -511,6 +514,8 @@ function renderTeacher(room) {
     const status = displayStatus(student.status);
     const card = document.createElement("details");
     card.className = "student-card student-monitor-card";
+    card.dataset.studentId = student.id;
+    card.open = state.openStudentCards.has(student.id);
     card.innerHTML = `
       <summary>
         <span class="student-card-main">
@@ -537,6 +542,13 @@ function renderTeacher(room) {
       </summary>
       ${renderTeacherStudentDetails(student)}
     `;
+    card.addEventListener("toggle", () => {
+      if (card.open) {
+        state.openStudentCards.add(student.id);
+      } else {
+        state.openStudentCards.delete(student.id);
+      }
+    });
     elements.studentList.append(card);
   });
 }
