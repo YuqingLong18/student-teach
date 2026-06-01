@@ -336,16 +336,55 @@ test("teacher login, room ownership, student teaching, testing, correction, and 
     studentHeaders(token),
   );
   assert.equal(firstAttempt.response.status, 201);
-  assert.equal(firstAttempt.payload.student.status, "Needs correction");
-  assert.equal(firstAttempt.payload.student.testAttempts[0].results[0].correct, true);
-  assert.equal(firstAttempt.payload.student.testAttempts[0].results[1].correct, false);
+  assert.equal(firstAttempt.payload.student.status, "Self-review");
+  assert.equal(firstAttempt.payload.student.testAttempts[0].results[0].correct, undefined);
+  assert.equal(firstAttempt.payload.student.testAttempts[0].results[1].correct, undefined);
   assert.ok(firstAttempt.payload.student.testAttempts[0].results[1].answer.length > 20);
   assert.equal(firstAttempt.payload.student.testAttempts[0].results[1].expectedAnswer, undefined);
   assert.equal(firstAttempt.payload.student.testAttempts[0].results[1].rubric, undefined);
-  assert.match(firstAttempt.payload.student.messages.at(-1).text, /Arena submission scored 1\/2/);
-  assert.match(firstAttempt.payload.student.messages.at(-1).text, /Problem 2 \(needs coaching\)/);
-  assert.match(firstAttempt.payload.student.messages.at(-1).text, /Peer solution:/);
+  assert.match(firstAttempt.payload.student.messages.at(-1).text, /Arena submission is ready for self-review/);
+  assert.doesNotMatch(firstAttempt.payload.student.messages.at(-1).text, /scored 1\/2/);
+  assert.doesNotMatch(firstAttempt.payload.student.messages.at(-1).text, /Peer solution:/);
   assert.doesNotMatch(firstAttempt.payload.student.messages.at(-1).text, /Answer key:/);
+  assert.deepEqual(firstAttempt.payload.room.arenaLeaderboard, []);
+
+  const firstAttemptId = firstAttempt.payload.student.testAttempts[0].id;
+  const alignedCorrect = await request(
+    baseUrl,
+    "POST",
+    `/api/classrooms/${roomCode}/students/${studentId}/test-attempts/${firstAttemptId}/results/0/assessment`,
+    { verdict: "correct" },
+    studentHeaders(token),
+  );
+  assert.equal(alignedCorrect.response.status, 200);
+  assert.equal(alignedCorrect.payload.student.status, "Self-review");
+  assert.equal(alignedCorrect.payload.student.testAttempts[0].results[0].correct, true);
+  assert.equal(alignedCorrect.payload.student.testAttempts[0].results[0].review.aligned, true);
+
+  const disagreed = await request(
+    baseUrl,
+    "POST",
+    `/api/classrooms/${roomCode}/students/${studentId}/test-attempts/${firstAttemptId}/results/1/assessment`,
+    { verdict: "correct" },
+    studentHeaders(token),
+  );
+  assert.equal(disagreed.response.status, 200);
+  assert.equal(disagreed.payload.student.status, "Self-review");
+  assert.equal(disagreed.payload.student.testAttempts[0].results[1].correct, undefined);
+  assert.equal(disagreed.payload.student.testAttempts[0].results[1].review.aligned, false);
+  assert.match(disagreed.payload.student.testAttempts[0].results[1].review.hint, /fairy thinks differently/);
+
+  const alignedWrong = await request(
+    baseUrl,
+    "POST",
+    `/api/classrooms/${roomCode}/students/${studentId}/test-attempts/${firstAttemptId}/results/1/assessment`,
+    { verdict: "wrong" },
+    studentHeaders(token),
+  );
+  assert.equal(alignedWrong.response.status, 200);
+  assert.equal(alignedWrong.payload.student.status, "Needs correction");
+  assert.equal(alignedWrong.payload.student.testAttempts[0].results[1].correct, false);
+  assert.equal(alignedWrong.payload.student.testAttempts[0].results[1].review.aligned, true);
 
   const correction = await request(
     baseUrl,
@@ -366,10 +405,26 @@ test("teacher login, room ownership, student teaching, testing, correction, and 
     studentHeaders(token),
   );
   assert.equal(finalAttempt.response.status, 201);
-  assert.equal(finalAttempt.payload.student.status, "Arena ranked");
-  assert.equal(finalAttempt.payload.student.testAttempts.at(-1).results.every((result) => result.correct), true);
-  assert.equal(finalAttempt.payload.room.arenaLeaderboard[0].name, "Mina");
-  assert.equal(finalAttempt.payload.room.arenaLeaderboard[0].percent, 100);
+  assert.equal(finalAttempt.payload.student.status, "Self-review");
+  assert.equal(finalAttempt.payload.student.testAttempts.at(-1).results.every((result) => result.correct === undefined), true);
+  assert.equal(finalAttempt.payload.room.arenaLeaderboard[0].percent, 50);
+
+  const finalAttemptId = finalAttempt.payload.student.testAttempts.at(-1).id;
+  let reviewedFinal = finalAttempt;
+  for (let resultIndex = 0; resultIndex < 2; resultIndex += 1) {
+    reviewedFinal = await request(
+      baseUrl,
+      "POST",
+      `/api/classrooms/${roomCode}/students/${studentId}/test-attempts/${finalAttemptId}/results/${resultIndex}/assessment`,
+      { verdict: "correct" },
+      studentHeaders(token),
+    );
+    assert.equal(reviewedFinal.response.status, 200);
+  }
+  assert.equal(reviewedFinal.payload.student.status, "Arena ranked");
+  assert.equal(reviewedFinal.payload.student.testAttempts.at(-1).results.every((result) => result.correct), true);
+  assert.equal(reviewedFinal.payload.room.arenaLeaderboard[0].name, "Mina");
+  assert.equal(reviewedFinal.payload.room.arenaLeaderboard[0].percent, 100);
 
   const teacherMonitor = await request(baseUrl, "GET", `/api/classrooms/${roomCode}`, null, teacherHeaders(teacher));
   assert.equal(teacherMonitor.response.status, 200);

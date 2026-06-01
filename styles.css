@@ -1007,6 +1007,11 @@ textarea:focus {
   background: rgba(217, 107, 74, 0.08);
 }
 
+.arena-review li.needs-review {
+  border-left-color: var(--gold);
+  background: rgba(199, 154, 47, 0.1);
+}
+
 .arena-review li span {
   color: var(--ink);
   font-weight: 800;
@@ -1021,6 +1026,10 @@ textarea:focus {
 
 .arena-review li.needs-coaching strong {
   color: #8d3d2b;
+}
+
+.arena-review li.needs-review strong {
+  color: #856414;
 }
 
 .correction-focus {
@@ -1081,6 +1090,10 @@ textarea:focus {
   border-left-color: var(--coral);
 }
 
+.result-card.needs-review {
+  border-left-color: var(--gold);
+}
+
 .answer-label {
   display: block;
   margin-bottom: 4px;
@@ -1093,6 +1106,38 @@ textarea:focus {
 
 .result-card .answer {
   color: var(--muted);
+}
+
+.self-check-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.self-check-button {
+  min-height: 34px;
+  padding: 6px 10px;
+  font-size: 0.76rem;
+  text-transform: uppercase;
+}
+
+.self-check-button.is-selected {
+  border-color: var(--green-dark);
+  background: rgba(50, 116, 91, 0.14);
+  color: var(--green-dark);
+}
+
+.self-check-button:disabled {
+  cursor: default;
+}
+
+.fairy-hint {
+  border: 1.5px solid var(--gold);
+  background: rgba(199, 154, 47, 0.12);
+  padding: 8px 10px;
+  color: #6f5310;
+  font-weight: 800;
 }
 
 .missing {

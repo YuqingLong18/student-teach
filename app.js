@@ -374,10 +374,12 @@ function serializeAnswerKeys(questions) {
 function scoreLatestTest(room, student) {
   if (!student.testAttempts.length) return null;
   const attempt = student.testAttempts[student.testAttempts.length - 1];
-  const correct = attempt.results.filter((result) => result.correct).length;
+  const reviewed = attempt.results.filter((result) => result.review?.reveal).length;
+  const correct = attempt.results.filter((result) => result.review?.reveal && result.correct).length;
   return {
     correct,
     total: room.testQuestions.length,
+    reviewed,
     percent: room.testQuestions.length ? Math.round((correct / room.testQuestions.length) * 100) : 0,
   };
 }
@@ -746,7 +748,11 @@ function renderStudent(room, student, options = {}) {
   });
 
   const latest = scoreLatestTest(room, student);
-  elements.studentScore.textContent = latest ? `${latest.correct}/${latest.total} arena` : "No score";
+  elements.studentScore.textContent = latest
+    ? latest.reviewed < latest.total
+      ? `${latest.reviewed}/${latest.total} reviewed`
+      : `${latest.correct}/${latest.total} arena`
+    : "No score";
   elements.testState.textContent = displayStatus(student.status);
   renderLeaderboard(elements.studentLeaderboard, room.arenaLeaderboard || []);
   const restoreChatPosition = renderChat(student.messages, options);
@@ -856,18 +862,33 @@ function renderTest(room, student) {
 
   attempt.results.forEach((result, index) => {
     const question = room.testQuestions[index];
+    const review = result.review || {};
+    const reveal = Boolean(review.reveal);
+    const selectedCorrect = review.verdict === "correct";
+    const selectedWrong = review.verdict === "wrong";
     const card = document.createElement("article");
-    card.className = `result-card ${result.correct ? "is-correct" : "needs-coaching"}`;
+    card.className = `result-card ${reveal ? (result.correct ? "is-correct" : "needs-coaching") : "needs-review"}`;
     card.innerHTML = `
       <header>
         <strong>Problem ${index + 1}</strong>
-        <span class="status-chip ${result.correct ? "ready" : "review"}">${result.correct ? "Correct" : "Needs coaching"}</span>
+        <span class="status-chip ${reveal && result.correct ? "ready" : reveal ? "review" : ""}">${
+          reveal ? (result.correct ? "Correct" : "Needs coaching") : "Self-check"
+        }</span>
       </header>
       <p>${escapeHtml(question.prompt)}</p>
       <strong class="answer-label">Peer solution</strong>
       <p class="answer">${escapeHtml(result.answer)}</p>
+      <div class="self-check-actions" role="group" aria-label="Mark problem ${index + 1}">
+        <button class="ghost-action self-check-button ${selectedCorrect ? "is-selected" : ""}" type="button" ${reveal ? "disabled" : ""} data-attempt-id="${escapeHtml(
+          attempt.id,
+        )}" data-result-index="${index}" data-verdict="correct">Correct</button>
+        <button class="ghost-action self-check-button ${selectedWrong ? "is-selected" : ""}" type="button" ${reveal ? "disabled" : ""} data-attempt-id="${escapeHtml(
+          attempt.id,
+        )}" data-result-index="${index}" data-verdict="wrong">Wrong</button>
+      </div>
+      ${review.hint ? `<p class="fairy-hint">${escapeHtml(review.hint)}</p>` : ""}
       ${
-        result.missingWords.length
+        reveal && result.missingWords.length
           ? `<p class="missing">Teach again: ${escapeHtml(result.missingWords.join(", "))}</p>`
           : ""
       }
@@ -878,24 +899,26 @@ function renderTest(room, student) {
 
 function renderArenaSummary(room, attempt) {
   const total = room.testQuestions.length;
-  const correct = attempt.results.filter((result) => result.correct).length;
+  const reviewed = attempt.results.filter((result) => result.review?.reveal).length;
+  const correct = attempt.results.filter((result) => result.review?.reveal && result.correct).length;
   const summary = document.createElement("article");
   summary.className = "arena-review";
   summary.innerHTML = `
     <header>
-      <strong>Latest arena review</strong>
-      <span>${correct}/${total}</span>
+      <strong>Latest self-review</strong>
+      <span>${reviewed}/${total}</span>
     </header>
     <ol>
       ${attempt.results
-        .map(
-          (result, index) => `
-            <li class="${result.correct ? "is-correct" : "needs-coaching"}">
+        .map((result, index) => {
+          const reveal = Boolean(result.review?.reveal);
+          return `
+            <li class="${reveal ? (result.correct ? "is-correct" : "needs-coaching") : "needs-review"}">
               <span>Problem ${index + 1}</span>
-              <strong>${result.correct ? "Correct" : "Needs coaching"}</strong>
+              <strong>${reveal ? (result.correct ? "Correct" : "Needs coaching") : "Self-check"}</strong>
             </li>
-          `,
-        )
+          `;
+        })
         .join("")}
     </ol>
   `;
@@ -1229,6 +1252,34 @@ elements.startTestButton.addEventListener("click", async () => {
     state.room = payload.room;
     state.student = payload.student;
     renderStudent(state.room, state.student, { forceChatScroll: true });
+    saveSession();
+  } catch (error) {
+    renderSystemMessage(error.message);
+  } finally {
+    restore();
+  }
+});
+
+elements.testResults.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-verdict]");
+  if (!button || !state.roomCode || !state.studentId) return;
+  const { attemptId, resultIndex, verdict } = button.dataset;
+  const restore = setBusy(button, "Checking...");
+
+  try {
+    const payload = await apiRequest(
+      `/api/classrooms/${encodeURIComponent(state.roomCode)}/students/${encodeURIComponent(
+        state.studentId,
+      )}/test-attempts/${encodeURIComponent(attemptId)}/results/${encodeURIComponent(resultIndex)}/assessment`,
+      {
+        method: "POST",
+        headers: studentHeaders(),
+        body: JSON.stringify({ verdict }),
+      },
+    );
+    state.room = payload.room;
+    state.student = payload.student;
+    renderStudent(state.room, state.student);
     saveSession();
   } catch (error) {
     renderSystemMessage(error.message);

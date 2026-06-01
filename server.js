@@ -929,6 +929,46 @@ function scoreLatestTest(room, student) {
   };
 }
 
+function resultReviewState(result) {
+  const verdict = result.selfAssessment?.verdict || null;
+  if (!verdict) {
+    return {
+      verdict: null,
+      aligned: null,
+      hint: null,
+      reveal: false,
+    };
+  }
+
+  const aligned = verdict === (result.correct ? "correct" : "wrong");
+  return {
+    verdict,
+    aligned,
+    hint: aligned ? null : "A little fairy thinks differently. Please check carefully.",
+    reveal: aligned,
+  };
+}
+
+function publicLatestMissingConcepts(student) {
+  const attempt = latestAttempt(student);
+  if (!attempt) return [];
+
+  return attempt.results
+    .filter((result) => {
+      const review = resultReviewState(result);
+      return review.reveal && !result.correct;
+    })
+    .flatMap((result) => result.missingWords || [])
+    .filter((word, index, words) => words.indexOf(word) === index);
+}
+
+function publicStudentStatus(student) {
+  const attempt = latestAttempt(student);
+  if (!attempt) return student.status;
+  const openReview = attempt.results.some((result) => !resultReviewState(result).reveal);
+  return openReview ? "Self-review" : student.status;
+}
+
 function arenaLeaderboardFromStudents(students) {
   return students
     .map((student) => {
@@ -962,6 +1002,14 @@ function arenaLeaderboardFromStudents(students) {
 
 function arenaLeaderboard(room) {
   return arenaLeaderboardFromStudents(Object.values(room.students || {}));
+}
+
+function publicArenaLeaderboard(room) {
+  const reviewedStudents = Object.values(room.students || {}).map((student) => ({
+    ...student,
+    testAttempts: student.testAttempts.filter((attempt) => attempt.results.every((result) => resultReviewState(result).reveal)),
+  }));
+  return arenaLeaderboardFromStudents(reviewedStudents);
 }
 
 function summarizeRoom(room) {
@@ -1063,28 +1111,23 @@ function publicArenaAttempts(student) {
     id: attempt.id,
     createdAt: attempt.createdAt,
     provider: attempt.provider,
-    results: attempt.results.map((result) => ({
-      answer: result.answer,
-      missingWords: result.missingWords || [],
-      correct: result.correct,
-    })),
+    results: attempt.results.map((result) => {
+      const review = resultReviewState(result);
+      return {
+        answer: result.answer,
+        missingWords: review.reveal && !result.correct ? result.missingWords || [] : [],
+        correct: review.reveal ? result.correct : undefined,
+        review,
+      };
+    }),
   }));
 }
 
-function arenaFeedbackMessage(room, results, correctCount) {
-  const lines = results.map((result, index) => {
-    const question = room.testQuestions[index];
-    const status = result.correct ? "correct" : "needs coaching";
-    const missing = result.missingWords?.length ? ` Missing concepts: ${result.missingWords.join(", ")}.` : "";
-    return `Problem ${index + 1} (${status}): ${question.prompt}\nPeer solution: ${result.answer}${missing}`;
-  });
-
+function arenaFeedbackMessage(room) {
   return [
-    `Arena submission scored ${correctCount}/${room.testQuestions.length}.`,
-    ...lines,
-    correctCount === room.testQuestions.length
-      ? "The peer is ready for the leaderboard. Keep refining explanations if you want a stronger solution style."
-      : "Use the chat to teach the missed concepts, ask the peer to explain them back, then enter the arena again.",
+    `Arena submission is ready for self-review.`,
+    `Read each peer response, decide whether it is correct or wrong, then check your judgment.`,
+    `There are ${room.testQuestions.length} arena problems to review.`,
   ].join("\n\n");
 }
 
@@ -1111,7 +1154,7 @@ function publicRoom(room) {
     peerChallenge: room.peerChallenge,
     objectives: room.objectives,
     testQuestions: publicArenaProblems(room),
-    arenaLeaderboard: arenaLeaderboard(room),
+    arenaLeaderboard: publicArenaLeaderboard(room),
     joinLocked: room.joinLocked,
     activityClosed: room.activityClosed,
     peerProvider: peerProviderStatus(),
@@ -1124,13 +1167,13 @@ function publicStudent(student, room) {
   return {
     id: student.id,
     name: student.name,
-    status: student.status,
+    status: publicStudentStatus(student),
     messages: student.messages,
     readinessChecks: student.readinessChecks,
     testAttempts: publicArenaAttempts(student),
     correctionTurns: correctionTurnsAfterLatestAttempt(student),
     objectiveProgress: objectiveProgress(room, student),
-    missingConcepts: latestMissingConcepts(student),
+    missingConcepts: publicLatestMissingConcepts(student),
     joinedAt: student.joinedAt,
     updatedAt: student.updatedAt,
   };
@@ -1491,7 +1534,7 @@ async function handleApi(request, response, url) {
       student.messages.push({
         id: crypto.randomUUID(),
         sender: "system",
-        text: arenaFeedbackMessage(room, results, correct),
+        text: arenaFeedbackMessage(room),
         createdAt: now(),
       });
       student.updatedAt = now();
@@ -1501,6 +1544,49 @@ async function handleApi(request, response, url) {
     } finally {
       activeArenaAttempts.delete(attemptKey);
     }
+  }
+
+  if (
+    request.method === "POST" &&
+    parts.length === 10 &&
+    parts[5] === "test-attempts" &&
+    parts[7] === "results" &&
+    parts[9] === "assessment"
+  ) {
+    requireStudentToken(request, student);
+    requireOpenActivity(room);
+    const attempt = student.testAttempts.find((item) => item.id === parts[6]);
+    if (!attempt) {
+      const error = new Error("Arena attempt not found.");
+      error.statusCode = 404;
+      throw error;
+    }
+
+    const resultIndex = Number(parts[8]);
+    const result = Number.isInteger(resultIndex) ? attempt.results[resultIndex] : null;
+    if (!result) {
+      const error = new Error("Arena result not found.");
+      error.statusCode = 404;
+      throw error;
+    }
+
+    const body = await parseJsonBody(request);
+    const verdict = String(body.verdict || "").trim().toLowerCase();
+    if (verdict !== "correct" && verdict !== "wrong") {
+      const error = new Error("verdict must be correct or wrong.");
+      error.statusCode = 400;
+      throw error;
+    }
+
+    result.selfAssessment = {
+      verdict,
+      aligned: verdict === (result.correct ? "correct" : "wrong"),
+      createdAt: now(),
+    };
+    student.updatedAt = now();
+    room.updatedAt = now();
+    await saveData();
+    return jsonResponse(response, 200, { room: publicRoom(room), student: publicStudent(student, room) });
   }
 
   return jsonResponse(response, 404, { error: "API route not found." });
