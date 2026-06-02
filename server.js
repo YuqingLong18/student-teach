@@ -37,6 +37,7 @@ const AUTH_COOKIE_DOMAIN = process.env.AUTH_COOKIE_DOMAIN || (AUTH_BASE_URL.incl
 const AUTH_COOKIE_SECURE =
   (process.env.AUTH_COOKIE_SECURE || "").toLowerCase() === "true" || AUTH_BASE_URL.startsWith("https://");
 const PEER_CHALLENGE_LEVELS = new Set(["gentle", "balanced", "rigorous"]);
+const GUEST_INVITE_CODE = process.env.GUEST_INVITE_CODE || "AIED2026";
 
 let store = { teachers: {}, classrooms: {} };
 let lastTimestamp = 0;
@@ -1209,7 +1210,7 @@ function requireTeacherAccess(request, room) {
 }
 
 function requireStudentToken(request, student) {
-  if (authEnabled()) {
+  if (authEnabled() && !student.guest) {
     const session = authSessionFromRequest(request);
     if (session?.role !== "student" || student.email !== session.email) {
       const error = new Error("Student Microsoft sign-in is required for this workspace.");
@@ -1418,17 +1419,24 @@ async function handleApi(request, response, url) {
 
     const body = await parseJsonBody(request);
     const authSession = authEnabled() ? authSessionFromRequest(request) : null;
-    if (authEnabled() && authSession?.role !== "student") {
+    const guestJoin = Boolean(body.guest);
+    if (guestJoin && String(body.invitationCode || "").trim() !== GUEST_INVITE_CODE) {
+      const error = new Error("A valid guest invitation code is required.");
+      error.statusCode = 401;
+      throw error;
+    }
+    if (authEnabled() && !guestJoin && authSession?.role !== "student") {
       const error = new Error("Student Microsoft sign-in is required.");
       error.statusCode = 401;
       throw error;
     }
-    const name = authSession ? authSession.name || authSession.email : requireString(body.name, "name");
+    const name = guestJoin ? requireString(body.name, "name") : authSession ? authSession.name || authSession.email : requireString(body.name, "name");
     const studentId = crypto.randomUUID();
     room.students[studentId] = {
       id: studentId,
       name,
-      email: authSession?.email,
+      email: guestJoin ? undefined : authSession?.email,
+      guest: guestJoin,
       status: "Teaching",
       messages: [
         {

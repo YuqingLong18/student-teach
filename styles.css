@@ -139,7 +139,7 @@ h3 {
 
 .role-tabs {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, 1fr);
   margin-bottom: 18px;
   border: 2px solid var(--strong-line);
 }
@@ -414,7 +414,11 @@ textarea:focus {
 }
 
 .teacher-grid {
-  grid-template-columns: minmax(300px, 0.8fr) minmax(320px, 1.2fr);
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.teacher-view.settings-mode .teacher-grid {
+  max-width: 980px;
 }
 
 .student-grid {
@@ -432,6 +436,20 @@ textarea:focus {
 .setup-panel {
   display: grid;
   gap: 14px;
+}
+
+.setup-panel textarea {
+  min-height: 160px;
+}
+
+.setup-panel #liveSystemPrompt {
+  min-height: 280px;
+}
+
+.settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .panel-heading {

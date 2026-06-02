@@ -14,7 +14,9 @@ const state = {
   student: null,
   pollTimer: null,
   monitorFilter: "all",
+  teacherSubView: "dashboard",
   openStudentCards: new Set(),
+  teacherConversationScroll: new Map(),
   chatScrollTouchedAt: 0,
   isRestoringChatScroll: false,
 };
@@ -22,6 +24,7 @@ const state = {
 const elements = {
   teacherTab: document.querySelector("#teacherTab"),
   studentTab: document.querySelector("#studentTab"),
+  guestTab: document.querySelector("#guestTab"),
   teacherForm: document.querySelector("#teacherForm"),
   teacherLoginButton: document.querySelector("#teacherLoginButton"),
   teacherIdentity: document.querySelector("#teacherIdentity"),
@@ -29,13 +32,16 @@ const elements = {
   classroomList: document.querySelector("#classroomList"),
   studentForm: document.querySelector("#studentForm"),
   studentLoginButton: document.querySelector("#studentLoginButton"),
+  guestForm: document.querySelector("#guestForm"),
   teacherError: document.querySelector("#teacherError"),
   joinError: document.querySelector("#joinError"),
+  guestError: document.querySelector("#guestError"),
   emptyState: document.querySelector("#emptyState"),
   teacherView: document.querySelector("#teacherView"),
   studentView: document.querySelector("#studentView"),
   roomCode: document.querySelector("#roomCode"),
   teacherProvider: document.querySelector("#teacherProvider"),
+  settingsButton: document.querySelector("#settingsButton"),
   joinLockButton: document.querySelector("#joinLockButton"),
   activityToggleButton: document.querySelector("#activityToggleButton"),
   teacherSignOutButton: document.querySelector("#teacherSignOutButton"),
@@ -46,6 +52,7 @@ const elements = {
   liveObjectives: document.querySelector("#liveObjectives"),
   liveTestQuestions: document.querySelector("#liveTestQuestions"),
   liveAnswerKeys: document.querySelector("#liveAnswerKeys"),
+  backToDashboardButton: document.querySelector("#backToDashboardButton"),
   saveConfigButton: document.querySelector("#saveConfigButton"),
   studentCount: document.querySelector("#studentCount"),
   monitorFilters: document.querySelector("#monitorFilters"),
@@ -118,6 +125,7 @@ function renderAuthAccess() {
     elements.teacherIdentity.textContent = "Signed out";
     elements.teacherError.textContent ||= "Sign in with your school Microsoft account.";
     elements.joinError.textContent ||= "Sign in with your school Microsoft account.";
+    elements.guestError.textContent = "";
     return;
   }
 
@@ -150,7 +158,7 @@ function saveSession() {
       localStorage.setItem(
         SESSION_KEY,
         JSON.stringify({
-          role: "student",
+          role: state.role === "guest" ? "guest" : "student",
           roomCode: state.roomCode,
           studentId: state.studentId,
           studentToken: state.studentToken,
@@ -258,7 +266,10 @@ function renderClassroomList(classrooms) {
 }
 
 async function resumeTeacherRoom(room) {
-  if (state.roomCode !== room.code) state.openStudentCards.clear();
+  if (state.roomCode !== room.code) {
+    state.openStudentCards.clear();
+    state.teacherConversationScroll.clear();
+  }
   state.roomCode = room.code;
   state.studentId = null;
   state.studentToken = null;
@@ -290,7 +301,9 @@ function resetTeacherSession() {
   state.studentToken = null;
   state.student = null;
   state.monitorFilter = "all";
+  state.teacherSubView = "dashboard";
   state.openStudentCards.clear();
+  state.teacherConversationScroll.clear();
   clearSession();
   renderTeacherIdentity();
   elements.classroomList.innerHTML = "";
@@ -310,6 +323,7 @@ function resetStudentSession() {
   state.student = null;
   clearSession();
   elements.joinError.textContent = "";
+  elements.guestError.textContent = "";
   showView("empty");
   setRole("student");
   renderAuthAccess();
@@ -398,10 +412,13 @@ function setRole(role) {
   state.role = role;
   elements.teacherTab.classList.toggle("is-active", role === "teacher");
   elements.studentTab.classList.toggle("is-active", role === "student");
+  elements.guestTab.classList.toggle("is-active", role === "guest");
   elements.teacherTab.setAttribute("aria-selected", role === "teacher");
   elements.studentTab.setAttribute("aria-selected", role === "student");
+  elements.guestTab.setAttribute("aria-selected", role === "guest");
   elements.teacherForm.classList.toggle("is-hidden", role !== "teacher");
   elements.studentForm.classList.toggle("is-hidden", role !== "student");
+  elements.guestForm.classList.toggle("is-hidden", role !== "guest");
   renderAuthAccess();
 }
 
@@ -487,6 +504,7 @@ function renderTeacher(room) {
   elements.activityToggleButton.setAttribute("aria-pressed", String(Boolean(room.activityClosed)));
   elements.activityToggleButton.classList.toggle("is-locked", Boolean(room.activityClosed));
   maybeUpdateConfigFields(room);
+  renderTeacherSubView();
 
   const students = room.students || [];
   elements.studentCount.textContent = `${students.length} active`;
@@ -552,6 +570,26 @@ function renderTeacher(room) {
       }
     });
     elements.studentList.append(card);
+    restoreTeacherConversationScroll(card, student.id);
+  });
+}
+
+function renderTeacherSubView() {
+  const settingsOpen = state.teacherSubView === "settings";
+  elements.teacherView.classList.toggle("settings-mode", settingsOpen);
+  document.querySelector(".setup-panel")?.classList.toggle("is-hidden", !settingsOpen);
+  document.querySelector(".monitor-panel")?.classList.toggle("is-hidden", settingsOpen);
+  elements.settingsButton.textContent = settingsOpen ? "Student dashboard" : "Peer AI settings";
+}
+
+function restoreTeacherConversationScroll(card, studentId) {
+  const history = card.querySelector(".message-history");
+  if (!history) return;
+
+  const scrollTop = state.teacherConversationScroll.get(studentId) || 0;
+  history.scrollTop = scrollTop;
+  requestAnimationFrame(() => {
+    history.scrollTop = scrollTop;
   });
 }
 
@@ -636,7 +674,7 @@ function renderTeacherStudentDetails(student) {
       }
       ${renderReadinessHistory(readinessChecks)}
       ${renderAttemptHistory(attempts)}
-      ${renderMessageHistory(messages)}
+      ${renderMessageHistory(messages, student.id)}
     </div>
   `;
 }
@@ -700,11 +738,11 @@ function renderAttemptHistory(attempts) {
   `;
 }
 
-function renderMessageHistory(messages) {
+function renderMessageHistory(messages, studentId) {
   if (!messages.length) return "";
 
   return `
-    <div class="message-history">
+    <div class="message-history" data-student-id="${escapeHtml(studentId)}">
       ${messages
         .map(
           (message) => `
@@ -1019,6 +1057,7 @@ function setBusy(button, busyText, options = {}) {
 
 elements.teacherTab.addEventListener("click", () => setRole("teacher"));
 elements.studentTab.addEventListener("click", () => setRole("student"));
+elements.guestTab.addEventListener("click", () => setRole("guest"));
 
 elements.teacherForm.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -1107,8 +1146,50 @@ elements.studentForm.addEventListener("submit", async (event) => {
   }
 });
 
+elements.guestForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  elements.guestError.textContent = "";
+  const restore = setBusy(event.submitter, "Joining...");
+
+  try {
+    const code = document.querySelector("#guestJoinCode").value.trim().toUpperCase();
+    const payload = await apiRequest(`/api/classrooms/${encodeURIComponent(code)}/students`, {
+      method: "POST",
+      body: JSON.stringify({
+        guest: true,
+        name: document.querySelector("#guestName").value.trim(),
+        invitationCode: document.querySelector("#guestInviteCode").value.trim(),
+      }),
+    });
+    state.role = "guest";
+    state.room = payload.room;
+    state.student = payload.student;
+    state.roomCode = payload.room.code;
+    state.teacherToken = null;
+    state.studentId = payload.student.id;
+    state.studentToken = payload.studentToken;
+    renderStudent(state.room, state.student, { forceChatScroll: true });
+    saveSession();
+    startPolling();
+  } catch (error) {
+    elements.guestError.textContent = error.message;
+  } finally {
+    restore();
+  }
+});
+
 elements.teacherLoginButton.addEventListener("click", teacherLogin);
 elements.studentLoginButton.addEventListener("click", () => beginMicrosoftSignIn("student"));
+
+elements.settingsButton.addEventListener("click", () => {
+  state.teacherSubView = state.teacherSubView === "settings" ? "dashboard" : "settings";
+  renderTeacherSubView();
+});
+
+elements.backToDashboardButton.addEventListener("click", () => {
+  state.teacherSubView = "dashboard";
+  renderTeacherSubView();
+});
 
 elements.saveConfigButton.addEventListener("click", async () => {
   if (!state.roomCode) return;
@@ -1144,6 +1225,17 @@ elements.monitorFilters.addEventListener("click", (event) => {
   state.monitorFilter = button.dataset.filter;
   if (state.room) renderTeacher(state.room);
 });
+
+elements.studentList.addEventListener(
+  "scroll",
+  (event) => {
+    const history = event.target.closest?.(".message-history");
+    const studentId = history?.dataset.studentId;
+    if (!studentId) return;
+    state.teacherConversationScroll.set(studentId, history.scrollTop);
+  },
+  true,
+);
 
 elements.joinLockButton.addEventListener("click", async () => {
   if (!state.roomCode || !state.room) return;
@@ -1316,7 +1408,7 @@ async function restoreSession() {
   }
 
   const session = loadSession();
-  if (state.authEnabled && !state.authUser) {
+  if (state.authEnabled && !state.authUser && session?.role !== "guest") {
     clearSession();
     return;
   }
@@ -1339,7 +1431,9 @@ async function restoreSession() {
   state.studentId = session.studentId || null;
   state.studentToken = session.studentToken || null;
 
-  if (session.role === "student" && state.studentId && state.studentToken && (!state.authEnabled || state.authUser?.role === "student")) {
+  if (session.role === "guest" && state.studentId && state.studentToken) {
+    setRole("guest");
+  } else if (session.role === "student" && state.studentId && state.studentToken && (!state.authEnabled || state.authUser?.role === "student")) {
     setRole("student");
   } else if (session.role === "teacher" && state.teacher && state.teacherSession && (!state.authEnabled || state.authUser?.role === "teacher")) {
     setRole("teacher");

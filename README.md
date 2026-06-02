@@ -12,6 +12,7 @@ This is a browser prototype plus a small dependency-free Node backend for the cl
 - Teacher can close or resume student activity while keeping monitoring available.
 - Arena problem lines support `problem | keywords | rubric`; hidden answer keys are entered separately in `Keys`, one key per problem.
 - Student joins with the classroom code.
+- Guest joins with a display name, the classroom code, and invitation code `AIED2026`.
 - The student browser receives a private session token for its own chat and arena workspace.
 - Student teaches a peer LLM through one chat thread.
 - The peer asks follow-up questions against uncovered objectives.
@@ -24,7 +25,7 @@ This is a browser prototype plus a small dependency-free Node backend for the cl
 - Teacher can filter the monitor by all students, readiness gaps, coaching needs, or ranked students.
 - Classroom data is persisted to `data/classrooms.json` by the local server.
 - Student API responses include teaching objectives, arena problem prompts, leaderboard entries, and that student's own record, not teacher prompts, answer keys, rubrics, or the full monitoring roster.
-- Teacher and student browser sessions are saved locally so a refresh can resume the active classroom.
+- Teacher, student, and guest browser sessions are saved locally so a refresh can resume the active classroom.
 - Teacher can sign out and students can leave the local session without deleting classroom data.
 
 ## Run

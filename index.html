@@ -51,6 +51,9 @@
             <button class="role-tab" id="studentTab" type="button" data-role="student" role="tab" aria-selected="false">
               Student
             </button>
+            <button class="role-tab" id="guestTab" type="button" data-role="guest" role="tab" aria-selected="false">
+              Guest
+            </button>
           </div>
 
           <form class="access-form" id="teacherForm">
@@ -103,6 +106,23 @@
             <button class="primary-action" type="submit">Join classroom</button>
             <p class="form-note" id="joinError" role="status" aria-live="polite"></p>
           </form>
+
+          <form class="access-form is-hidden" id="guestForm">
+            <label>
+              Guest name
+              <input id="guestName" name="guestName" type="text" autocomplete="name" required />
+            </label>
+            <label>
+              Classroom code
+              <input id="guestJoinCode" name="guestJoinCode" type="text" autocomplete="off" required />
+            </label>
+            <label>
+              Invitation code
+              <input id="guestInviteCode" name="guestInviteCode" type="text" autocomplete="off" required />
+            </label>
+            <button class="primary-action" type="submit">Join as guest</button>
+            <p class="form-note" id="guestError" role="status" aria-live="polite"></p>
+          </form>
         </aside>
 
         <section class="main-stage">
@@ -125,6 +145,7 @@
                 <span>Class code</span>
                 <strong id="roomCode">------</strong>
                 <small id="teacherProvider">Peer: simulator</small>
+                <button class="ghost-action join-lock-button" id="settingsButton" type="button">Peer AI settings</button>
                 <button class="ghost-action join-lock-button" id="joinLockButton" type="button" aria-pressed="false">Lock joins</button>
                 <button class="ghost-action join-lock-button" id="activityToggleButton" type="button" aria-pressed="false">Close activity</button>
                 <button class="ghost-action session-action" id="teacherSignOutButton" type="button">Sign out</button>
@@ -135,7 +156,10 @@
               <section class="setup-panel">
                 <div class="panel-heading">
                   <h3>Peer AI settings</h3>
-                  <button class="ghost-action" id="saveConfigButton" type="button">Save updates</button>
+                  <div class="settings-actions">
+                    <button class="ghost-action" id="backToDashboardButton" type="button">Back to dashboard</button>
+                    <button class="ghost-action" id="saveConfigButton" type="button">Save updates</button>
+                  </div>
                 </div>
                 <label>
                   Class title

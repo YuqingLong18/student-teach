@@ -386,6 +386,13 @@ test("teacher login, room ownership, student teaching, testing, correction, and 
   assert.equal(alignedWrong.payload.student.testAttempts[0].results[1].correct, false);
   assert.equal(alignedWrong.payload.student.testAttempts[0].results[1].review.aligned, true);
 
+  const teacherMonitorAfterSelfReview = await request(baseUrl, "GET", `/api/classrooms/${roomCode}`, null, teacherHeaders(teacher));
+  assert.equal(teacherMonitorAfterSelfReview.response.status, 200);
+  assert.equal(teacherMonitorAfterSelfReview.payload.room.students[0].latestScore.correct, 1);
+  assert.equal(teacherMonitorAfterSelfReview.payload.room.students[0].latestScore.total, 2);
+  assert.equal(teacherMonitorAfterSelfReview.payload.room.students[0].latestScore.percent, 50);
+  assert.equal(teacherMonitorAfterSelfReview.payload.room.analytics.averageScore, 50);
+
   const correction = await request(
     baseUrl,
     "POST",
@@ -500,4 +507,32 @@ test("microsoft teacher session can create and list classrooms", async (t) => {
     list.payload.classrooms.map((room) => room.code),
     [created.payload.room.code],
   );
+
+  const rejectedGuest = await request(
+    baseUrl,
+    "POST",
+    `/api/classrooms/${created.payload.room.code}/students`,
+    { guest: true, name: "Guest One", invitationCode: "WRONG" },
+  );
+  assert.equal(rejectedGuest.response.status, 401);
+
+  const guestJoin = await request(
+    baseUrl,
+    "POST",
+    `/api/classrooms/${created.payload.room.code}/students`,
+    { guest: true, name: "Guest One", invitationCode: "AIED2026" },
+  );
+  assert.equal(guestJoin.response.status, 201);
+  assert.equal(guestJoin.payload.student.name, "Guest One");
+  assert.ok(guestJoin.payload.studentToken);
+
+  const guestRead = await request(
+    baseUrl,
+    "GET",
+    `/api/classrooms/${created.payload.room.code}/students/${guestJoin.payload.student.id}`,
+    null,
+    studentHeaders(guestJoin.payload.studentToken),
+  );
+  assert.equal(guestRead.response.status, 200);
+  assert.equal(guestRead.payload.student.status, "Teaching");
 });
